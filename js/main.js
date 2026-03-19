@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { initViewer, loadGeometry, setMeshMaterial, setWireframe,
+import { initViewer, loadGeometry, setMeshMaterial, setMeshGeometry, setWireframe,
          getControls, getCamera, getCurrentMesh,
          setExclusionOverlay, setHoverPreview, setViewerTheme } from './viewer.js';
 import { loadSTLFile, computeBounds, getTriangleCount }  from './stlLoader.js';
@@ -53,7 +53,12 @@ const settings = {
   mappingBlend:     1,
   seamBandWidth:    0.5,
   symmetricDisplacement: false,
+  useDisplacement: false,
 };
+
+// ── Displacement preview state ────────────────────────────────────────────────
+let dispPreviewGeometry  = null;   // subdivided geometry with smoothNormal attribute
+let dispPreviewBusy      = false;  // true while async subdivision is running
 
 // ── DOM refs ──────────────────────────────────────────────────────────────────
 
@@ -104,6 +109,7 @@ const seamBlendVal           = document.getElementById('seam-blend-val');
 const seamBandWidthSlider    = document.getElementById('seam-band-width');
 const seamBandWidthVal       = document.getElementById('seam-band-width-val');
 const symmetricDispToggle    = document.getElementById('symmetric-displacement');
+const dispPreviewToggle      = document.getElementById('displacement-preview');
 
 // ── Exclusion panel DOM refs ──────────────────────────────────────────────────
 const exclBrushBtn        = document.getElementById('excl-brush-btn');
@@ -320,6 +326,10 @@ function wireEvents() {
   symmetricDispToggle.addEventListener('change', () => {
     settings.symmetricDisplacement = symmetricDispToggle.checked;
     updatePreview();
+  });
+
+  dispPreviewToggle.addEventListener('change', () => {
+    toggleDisplacementPreview(dispPreviewToggle.checked);
   });
 
   // ── Export ──
@@ -695,6 +705,11 @@ function loadDefaultCube() {
   loadGeometry(geo);
   dropHint.classList.add('hidden');
 
+  // Reset displacement preview
+  if (dispPreviewGeometry) { dispPreviewGeometry.dispose(); dispPreviewGeometry = null; }
+  settings.useDisplacement = false;
+  dispPreviewToggle.checked = false;
+
   // Reset exclusion state
   excludedFaces     = new Set();
   exclusionTool     = null;
@@ -762,6 +777,11 @@ async function handleSTL(file) {
     // Show mesh with a default material until a map is selected
     loadGeometry(geometry);
     dropHint.classList.add('hidden');
+
+    // Reset displacement preview for the new mesh
+    if (dispPreviewGeometry) { dispPreviewGeometry.dispose(); dispPreviewGeometry = null; }
+    settings.useDisplacement = false;
+    dispPreviewToggle.checked = false;
 
     // Reset exclusion state for the new mesh
     excludedFaces     = new Set();
@@ -842,14 +862,151 @@ function updatePreview() {
     return;
   }
 
+  // Choose geometry: subdivided preview (with smoothNormal attribute) or original
+  const activeGeo = (settings.useDisplacement && dispPreviewGeometry)
+    ? dispPreviewGeometry
+    : currentGeometry;
+
   if (!previewMaterial) {
     previewMaterial = createPreviewMaterial(activeMapEntry.texture, fullSettings);
-    loadGeometry(currentGeometry, previewMaterial);
+    loadGeometry(activeGeo, previewMaterial);
   } else {
     updateMaterial(previewMaterial, activeMapEntry.texture, fullSettings);
   }
 
   exportBtn.disabled = false;
+}
+
+// ── Displacement preview ──────────────────────────────────────────────────────
+
+/**
+ * Compute area-weighted smooth normals for a non-indexed geometry and store
+ * them as a `smoothNormal` vec3 attribute.  Every copy of the same position
+ * gets the same averaged normal so vertex-shader displacement is watertight.
+ */
+function addSmoothNormals(geometry) {
+  const pos   = geometry.attributes.position.array;
+  const count = geometry.attributes.position.count;
+
+  const QUANT = 1e4;
+  const key = (x, y, z) =>
+    `${Math.round(x * QUANT)}_${Math.round(y * QUANT)}_${Math.round(z * QUANT)}`;
+
+  // Accumulate area-weighted face normals per unique position
+  const nrmMap = new Map();
+  const vA = new THREE.Vector3(), vB = new THREE.Vector3(), vC = new THREE.Vector3();
+  const e1 = new THREE.Vector3(), e2 = new THREE.Vector3(), fn = new THREE.Vector3();
+
+  for (let i = 0; i < count; i += 3) {
+    vA.set(pos[i * 3], pos[i * 3 + 1], pos[i * 3 + 2]);
+    vB.set(pos[(i + 1) * 3], pos[(i + 1) * 3 + 1], pos[(i + 1) * 3 + 2]);
+    vC.set(pos[(i + 2) * 3], pos[(i + 2) * 3 + 1], pos[(i + 2) * 3 + 2]);
+    e1.subVectors(vB, vA);
+    e2.subVectors(vC, vA);
+    fn.crossVectors(e1, e2); // length = 2 × triangle area
+    const area = fn.length();
+    if (area < 1e-12) continue;
+    fn.divideScalar(area); // unit face normal
+    for (const v of [vA, vB, vC]) {
+      const k = key(v.x, v.y, v.z);
+      const prev = nrmMap.get(k);
+      if (prev) {
+        prev[0] += fn.x * area;
+        prev[1] += fn.y * area;
+        prev[2] += fn.z * area;
+      } else {
+        nrmMap.set(k, [fn.x * area, fn.y * area, fn.z * area]);
+      }
+    }
+  }
+
+  // Normalize accumulated normals
+  for (const n of nrmMap.values()) {
+    const len = Math.sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+    if (len > 1e-12) { n[0] /= len; n[1] /= len; n[2] /= len; }
+  }
+
+  // Write smoothNormal attribute
+  const sn = new Float32Array(count * 3);
+  for (let i = 0; i < count; i++) {
+    const k = key(pos[i * 3], pos[i * 3 + 1], pos[i * 3 + 2]);
+    const n = nrmMap.get(k);
+    if (n) { sn[i * 3] = n[0]; sn[i * 3 + 1] = n[1]; sn[i * 3 + 2] = n[2]; }
+    else   { sn[i * 3] = 0; sn[i * 3 + 1] = 0; sn[i * 3 + 2] = 1; }
+  }
+  geometry.setAttribute('smoothNormal', new THREE.Float32BufferAttribute(sn, 3));
+}
+
+/**
+ * Toggle displacement preview on/off.
+ * When enabled: subdivides the current geometry to a moderate resolution,
+ * computes smooth normals, and switches the viewer to the subdivided
+ * geometry with vertex-shader displacement.
+ * When disabled: reverts to the original geometry with bump-only preview.
+ */
+async function toggleDisplacementPreview(enable) {
+  settings.useDisplacement = enable;
+
+  if (!enable) {
+    // Revert to original geometry with bump-only shading.
+    if (currentGeometry && previewMaterial) {
+      updateMaterial(previewMaterial, activeMapEntry?.texture, { ...settings, bounds: currentBounds });
+      setMeshGeometry(currentGeometry);
+    }
+    // Dispose the subdivided preview geometry (no longer on the mesh)
+    if (dispPreviewGeometry) {
+      dispPreviewGeometry.dispose();
+      dispPreviewGeometry = null;
+    }
+    return;
+  }
+
+  // Need a model and texture to subdivide
+  if (!currentGeometry || !currentBounds || !activeMapEntry) {
+    dispPreviewToggle.checked = false;
+    settings.useDisplacement = false;
+    return;
+  }
+
+  if (dispPreviewBusy) return;
+  dispPreviewBusy = true;
+
+  try {
+    // Choose a preview edge length: coarser than export for performance.
+    // Target ~maxDim/80 so a 50 mm cube gets ~0.6 mm edges → ~100 k triangles.
+    const maxDim = Math.max(currentBounds.size.x, currentBounds.size.y, currentBounds.size.z);
+    const previewEdge = Math.max(0.1, maxDim / 80);
+
+    await yieldFrame();
+
+    const { geometry: subdivided } = await subdivide(
+      currentGeometry, previewEdge, null, null
+    );
+
+    addSmoothNormals(subdivided);
+
+    // Dispose previous preview geometry if any
+    if (dispPreviewGeometry) dispPreviewGeometry.dispose();
+    dispPreviewGeometry = subdivided;
+
+    // Force material recreation so it binds the new geometry with smoothNormal
+    if (previewMaterial) {
+      previewMaterial.dispose();
+      previewMaterial = null;
+    }
+    const fullSettings = { ...settings, bounds: currentBounds };
+    previewMaterial = createPreviewMaterial(activeMapEntry.texture, fullSettings);
+    setMeshGeometry(dispPreviewGeometry);
+    setMeshMaterial(previewMaterial);
+
+
+  } catch (err) {
+    console.error('Displacement preview failed:', err);
+    dispPreviewToggle.checked = false;
+    settings.useDisplacement = false;
+  } finally {
+    dispPreviewBusy = false;
+  }
 }
 
 // ── Export pipeline ───────────────────────────────────────────────────────────

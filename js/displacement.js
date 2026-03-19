@@ -251,7 +251,7 @@ export function applyDisplacement(geometry, imageData, imgWidth, imgHeight, sett
     const isSealedBoundary = !isFaceExcluded && excludedPosSet && excludedPosSet.has(k);
     const mf         = maskedFracMap.get(k) || [0, 1];
     const maskedFrac = mf[1] > 0 ? mf[0] / mf[1] : 0;
-    const centeredGrey = settings.symmetricDisplacement ? (grey - 0.5) * 2.0 : grey;
+    const centeredGrey = settings.symmetricDisplacement ? (grey - 0.5) : grey;
     const disp = (isFaceExcluded || isSealedBoundary) ? 0 : (1 - maskedFrac) * centeredGrey * settings.amplitude;
 
     const newX = tmpPos.x + sn[0] * disp;

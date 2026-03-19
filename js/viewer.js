@@ -301,6 +301,26 @@ export function setMeshMaterial(material) {
 }
 
 /**
+ * Swap only the geometry on the current mesh, keeping material and camera.
+ * Rebuilds wireframe if visible.  Does NOT reset camera or grid.
+ * The caller is responsible for disposing old geometry if needed.
+ * @param {THREE.BufferGeometry} geometry
+ */
+export function setMeshGeometry(geometry) {
+  if (!currentMesh) return;
+  if (!geometry.attributes.normal) geometry.computeVertexNormals();
+  currentMesh.geometry = geometry;
+  // Rebuild wireframe overlay to match the new geometry
+  if (wireframeLines) {
+    meshGroup.remove(wireframeLines);
+    wireframeLines.geometry.dispose();
+    wireframeLines.material.dispose();
+    wireframeLines = null;
+  }
+  if (wireframeVisible) _buildWireframe(geometry);
+}
+
+/**
  * Get the grid object so callers can adjust position.
  */
 export function getGrid() { return grid; }

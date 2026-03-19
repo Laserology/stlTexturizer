@@ -96,6 +96,11 @@ export const TRANSLATIONS = {
     'labels.symmetricDisplacement':  'Symmetric displacement \u24d8',
     'tooltips.symmetricDisplacement':'When on, 50% grey = no displacement; white pushes out, black pushes in. Keeps part volume roughly constant.',
 
+    // Displacement preview
+    'labels.displacementPreview':    '3D Preview \u24d8',
+    'tooltips.displacementPreview':  'Subdivides the mesh and displaces vertices in real-time so you can judge the actual depth. GPU-intensive on complex models.',
+    'progress.subdividingPreview':   'Preparing preview\u2026',
+
     // Amplitude overlap warning
     'warnings.amplitudeOverlap':     '\u26a0 Amplitude exceeds 10% of the smallest model dimension \u2014 geometry overlaps may occur in the exported STL.',
 
@@ -228,6 +233,11 @@ export const TRANSLATIONS = {
     // Symmetric displacement
     'labels.symmetricDisplacement':  'Symmetrische Verschiebung \u24d8',
     'tooltips.symmetricDisplacement':'Wenn aktiv: 50% Grau = keine Verschiebung; Weiß nach außen, Schwarz nach innen. H\u00e4lt das Volumen des Teils in etwa konstant.',
+
+    // Displacement preview
+    'labels.displacementPreview':    '3D-Vorschau \u24d8',
+    'tooltips.displacementPreview':  'Unterteilt das Netz und verschiebt Punkte in Echtzeit, damit die tats\u00e4chliche Tiefe sichtbar wird. GPU-intensiv bei komplexen Modellen.',
+    'progress.subdividingPreview':   'Vorschau wird vorbereitet\u2026',
 
     // Amplitude overlap warning
     'warnings.amplitudeOverlap':     '\u26a0 Amplitude \u00fcberschreitet 10% der kleinsten Modellabmessung \u2014 beim Export k\u00f6nnen Geometrie\u00fcberschneidungen auftreten.',

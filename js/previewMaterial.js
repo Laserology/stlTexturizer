@@ -11,38 +11,17 @@ export const MODE_CUBIC       = 6;
 
 // ── GLSL source ──────────────────────────────────────────────────────────────
 //
-// Preview strategy: NO vertex displacement.
-// All UV projection is done in the fragment shader so the underlying mesh
-// geometry is never modified.  The displacement map is visualised via
-// per-fragment bump mapping (perturbing the shading normal from screen-space
-// height derivatives).  `amplitude` scales the bump intensity only.
+// Preview strategy, two modes:
+//   1. Bump-only (default):  UV projection & bump mapping in the fragment shader.
+//      The underlying geometry is never modified; amplitude scales bump intensity.
+//   2. Displacement preview: The vertex shader samples the same displacement
+//      texture and physically moves each vertex along its smooth normal.
+//      Fragment shader adds reduced bump mapping for sub-vertex detail.
+//
+// The shared GLSL block below is included in BOTH shaders so UV math,
+// projection modes, and texture sampling stay identical.
 
-const vertexShader = /* glsl */`
-  precision highp float;
-
-  varying vec3 vModelPos;    // model-space position  → UV computation in fragment
-  varying vec3 vModelNormal; // model-space normal    → stable UV blending (triplanar/cubic)
-  varying vec3 vViewPos;     // view-space position   → TBN & specular
-  varying vec3 vNormal;      // view-space normal     → lighting
-
-  void main() {
-    vModelPos = position;
-    // Guard against degenerate zero-length normals (non-manifold / multi-body STLs
-    // can produce averaged-to-zero normals at shared vertices between opposing bodies).
-    // normalize(vec3(0)) is undefined in GLSL and produces NaN on most GPUs,
-    // which then turns the entire fragment black.
-    vec3 safeN   = length(normal) > 1e-6 ? normalize(normal) : vec3(0.0, 0.0, 1.0);
-    vModelNormal = safeN;
-    vec4 mvPos   = modelViewMatrix * vec4(position, 1.0);
-    vViewPos     = mvPos.xyz;
-    vNormal      = normalize(normalMatrix * safeN);
-    gl_Position  = projectionMatrix * mvPos;
-  }
-`;
-
-const fragmentShader = /* glsl */`
-  precision highp float;
-
+const sharedGLSL = /* glsl */`
   uniform sampler2D displacementMap;
   uniform int       mappingMode;
   uniform vec2      scaleUV;
@@ -52,16 +31,12 @@ const fragmentShader = /* glsl */`
   uniform vec3      boundsMin;
   uniform vec3      boundsSize;
   uniform vec3      boundsCenter;
-  uniform float     bottomAngleLimit; // degrees from horizontal; 0 = disabled
-  uniform float     topAngleLimit;    // degrees from horizontal; 0 = disabled
-  uniform float     mappingBlend;     // 0 = sharp seams, 1 = fully blended
-  uniform float     seamBandWidth;    // width of the blend zone near cube-face seams
-  uniform int       symmetricDisplacement; // 1 = remap [0,1]→[-1,1] so 50% grey = no disp
-
-  varying vec3 vModelPos;
-  varying vec3 vModelNormal;
-  varying vec3 vViewPos;
-  varying vec3 vNormal;
+  uniform float     bottomAngleLimit;
+  uniform float     topAngleLimit;
+  uniform float     mappingBlend;
+  uniform float     seamBandWidth;
+  uniform int       symmetricDisplacement;
+  uniform int       useDisplacement;
 
   const float PI     = 3.14159265358979;
   const float TWO_PI = 6.28318530717959;
@@ -108,7 +83,6 @@ const fragmentShader = /* glsl */`
   // Sample after applying scale + tiling
   float sampleMap(vec2 rawUV) {
     vec2 uv = rawUV / scaleUV + offsetUV;
-    // rotate around tile centre
     float c = cos(rotation); float s = sin(rotation);
     uv -= 0.5;
     uv  = vec2(c * uv.x - s * uv.y, s * uv.x + c * uv.y);
@@ -116,23 +90,13 @@ const fragmentShader = /* glsl */`
     return texture2D(displacementMap, uv).r;
   }
 
-  // Height at this fragment for all projection modes.
-  // Uses vModelPos / vModelNormal (model-space) so UV is stable as the camera orbits.
-  float getHeight() {
-    vec3 pos = vModelPos;
-    vec3 MN  = vModelNormal;  // smooth interpolated normal → shading only
+  // Compute displacement height at a world-space point.
+  // projN  = face-stable projection normal (for axis selection)
+  // blendN = smooth / interpolated normal  (for blend weights)
+  float computeHeightAtPoint(vec3 pos, vec3 projN, vec3 blendN) {
     vec3 rel = pos - boundsCenter;
     float maxDim = max(boundsSize.x, max(boundsSize.y, boundsSize.z));
     float md = max(maxDim, 1e-4);
-
-    // Face-stable projection normal: cross product of screen-space position
-    // derivatives is CONSTANT within a triangle (unlike the interpolated
-    // vModelNormal), eliminating within-face texture z-fighting at seam
-    // boundaries in cubic / triplanar mapping. Falls back to MN if degenerate.
-    vec3 _dpx = dFdx(vModelPos);
-    vec3 _dpy = dFdy(vModelPos);
-    vec3 _fN  = cross(_dpx, _dpy);
-    vec3 PN   = length(_fN) > 1e-10 ? normalize(_fN) : MN;
 
     if (mappingMode == 0) {
       return sampleMap(vec2((pos.x - boundsMin.x) / md, (pos.y - boundsMin.y) / md));
@@ -144,62 +108,119 @@ const fragmentShader = /* glsl */`
       return sampleMap(vec2((pos.y - boundsMin.y) / md, (pos.z - boundsMin.z) / md));
 
     } else if (mappingMode == 3) {
-      // Cylindrical around Z axis (Z is up) with blendable side↔cap transition.
       float r = max(boundsSize.x, boundsSize.y) * 0.5;
       float C = TWO_PI * max(r, 1e-4);
       float hSide = sampleMap(vec2(atan(rel.y, rel.x) / TWO_PI + 0.5,
                                    (pos.z - boundsMin.z) / C));
       if (mappingBlend < 0.001) return hSide;
       float blendHalf = mappingBlend * 0.20;
-      float capW = smoothstep(0.7 - blendHalf, 0.7 + blendHalf, abs(vModelNormal.z));
+      float capW = smoothstep(0.7 - blendHalf, 0.7 + blendHalf, abs(blendN.z));
       float hCap  = sampleMap(vec2(rel.x / C + 0.5, rel.y / C + 0.5));
       return mix(hSide, hCap, capW);
 
     } else if (mappingMode == 4) {
-      // Spherical — Z is up
       float r     = length(rel);
       float phi   = acos(clamp(rel.z / max(r, 1e-4), -1.0, 1.0));
       float theta = atan(rel.y, rel.x);
       return sampleMap(vec2(theta / TWO_PI + 0.5, phi / PI));
 
     } else if (mappingMode == 5) {
-      // Triplanar – smooth blend using face-stable projection normal (constant per triangle)
-      vec3 blend = abs(PN);
+      vec3 blend = abs(projN);
       blend = pow(blend, vec3(4.0));
       blend /= dot(blend, vec3(1.0)) + 1e-4;
-
       float hXY = sampleMap(vec2((pos.x - boundsMin.x) / md, (pos.y - boundsMin.y) / md));
       float hXZ = sampleMap(vec2((pos.x - boundsMin.x) / md, (pos.z - boundsMin.z) / md));
       float hYZ = sampleMap(vec2((pos.y - boundsMin.y) / md, (pos.z - boundsMin.z) / md));
-
       return hXY * blend.z + hXZ * blend.y + hYZ * blend.x;
 
     } else {
-      // Cubic (box) – use smooth normals for blend weights so high blend values
-      // can hide seams, but fall back to the face-stable triangle normal when
-      // the triangle sits on an ambiguous near-45° tie.
       float hYZ = sampleMap(vec2((pos.y - boundsMin.y) / md, (pos.z - boundsMin.z) / md));
       float hXZ = sampleMap(vec2((pos.x - boundsMin.x) / md, (pos.z - boundsMin.z) / md));
       float hXY = sampleMap(vec2((pos.x - boundsMin.x) / md, (pos.y - boundsMin.y) / md));
-      vec3 blendN = vModelNormal;
-      vec3 absFaceN = abs(PN);
+      vec3 bN = blendN;
+      vec3 absFaceN = abs(projN);
       float facePrimary = max(absFaceN.x, max(absFaceN.y, absFaceN.z));
-      float faceSecondary = absFaceN.x + absFaceN.y + absFaceN.z - facePrimary - min(absFaceN.x, min(absFaceN.y, absFaceN.z));
-      if (facePrimary - faceSecondary <= CUBIC_AXIS_EPSILON) blendN = PN;
-      vec3 wts = cubicBlendWeights(blendN);
+      float faceSecondary = absFaceN.x + absFaceN.y + absFaceN.z - facePrimary
+                          - min(absFaceN.x, min(absFaceN.y, absFaceN.z));
+      if (facePrimary - faceSecondary <= CUBIC_AXIS_EPSILON) bN = projN;
+      vec3 wts = cubicBlendWeights(bN);
       return hYZ * wts.x + hXZ * wts.y + hXY * wts.z;
     }
+  }
+`;
+
+const vertexShader = /* glsl */`
+  precision highp float;
+  ${sharedGLSL}
+
+  attribute vec3 smoothNormal;
+
+  varying vec3 vModelPos;    // ORIGINAL model-space position → UV computation in fragment
+  varying vec3 vModelNormal; // model-space face normal       → stable UV blending
+  varying vec3 vViewPos;     // view-space position (possibly displaced) → TBN & specular
+  varying vec3 vNormal;      // view-space normal → lighting
+
+  void main() {
+    vec3 safeN = length(normal) > 1e-6 ? normalize(normal) : vec3(0.0, 0.0, 1.0);
+    vec3 pos = position;
+
+    if (useDisplacement == 1) {
+      // Sample displacement texture using the same UV math as the fragment shader
+      float h = computeHeightAtPoint(position, safeN, safeN);
+      if (symmetricDisplacement == 1) h = h - 0.5;
+
+      // Surface angle masking (same logic as fragment shader)
+      float surfaceAngle = degrees(acos(clamp(abs(safeN.z), 0.0, 1.0)));
+      float maskBlend = 1.0;
+      float FADE = 15.0;
+      if (safeN.z <  0.0 && bottomAngleLimit >= 1.0)
+        maskBlend = min(maskBlend, smoothstep(bottomAngleLimit, bottomAngleLimit + FADE, surfaceAngle));
+      if (safeN.z >= 0.0 && topAngleLimit >= 1.0)
+        maskBlend = min(maskBlend, smoothstep(topAngleLimit, topAngleLimit + FADE, surfaceAngle));
+      h = mix(0.0, h, maskBlend);
+
+      // Displace along smooth normal so all copies of the same position
+      // arrive at the same point (watertight, no cracks).
+      vec3 sN = length(smoothNormal) > 1e-6 ? normalize(smoothNormal) : safeN;
+      pos = position + sN * h * amplitude;
+    }
+
+    // Always pass the ORIGINAL position for UV computation in the fragment shader.
+    vModelPos    = position;
+    vModelNormal = safeN;
+    vec4 mvPos   = modelViewMatrix * vec4(pos, 1.0);
+    vViewPos     = mvPos.xyz;
+    vNormal      = normalize(normalMatrix * safeN);
+    gl_Position  = projectionMatrix * mvPos;
+  }
+`;
+
+const fragmentShader = /* glsl */`
+  precision highp float;
+  ${sharedGLSL}
+
+  varying vec3 vModelPos;
+  varying vec3 vModelNormal;
+  varying vec3 vViewPos;
+  varying vec3 vNormal;
+
+  // Fragment-only wrapper: compute face-stable projection normal via dFdx
+  // then delegate to the shared height function.
+  float getHeight() {
+    vec3 _dpx = dFdx(vModelPos);
+    vec3 _dpy = dFdy(vModelPos);
+    vec3 _fN  = cross(_dpx, _dpy);
+    vec3 PN   = length(_fN) > 1e-10 ? normalize(_fN) : vModelNormal;
+    return computeHeightAtPoint(vModelPos, PN, vModelNormal);
   }
 
   void main() {
     // Flip normal for back faces so flipped-winding geometry still lights correctly.
     vec3 N = normalize(vNormal) * (gl_FrontFacing ? 1.0 : -1.0);
     float h = getHeight();
-    if (symmetricDisplacement == 1) h = h * 2.0 - 1.0; // remap [0,1]→[-1,1]: 0.5 grey = zero
+    if (symmetricDisplacement == 1) h = h - 0.5;
 
-    // ── Surface angle masking (FDM: suppress texture on near-horizontal faces) ────
-    // Use a 15° smoothstep fade above the threshold so the bump tapers gradually
-    // into the masked region rather than cutting off abruptly at the boundary edge.
+    // ── Surface angle masking ─────────────────────────────────────────────
     float surfaceAngle = degrees(acos(clamp(abs(vModelNormal.z), 0.0, 1.0)));
     float maskBlend = 1.0;
     float FADE = 15.0;
@@ -207,7 +228,7 @@ const fragmentShader = /* glsl */`
       maskBlend = min(maskBlend, smoothstep(bottomAngleLimit, bottomAngleLimit + FADE, surfaceAngle));
     if (vModelNormal.z >= 0.0 && topAngleLimit >= 1.0)
       maskBlend = min(maskBlend, smoothstep(topAngleLimit, topAngleLimit + FADE, surfaceAngle));
-    h = mix(0.0, h, maskBlend); // blend toward neutral (zero-gradient → no bump)
+    h = mix(0.0, h, maskBlend);
 
     // ── Bump mapping via screen-space height derivatives ──────────────────
     float dhx = dFdx(h);
@@ -223,10 +244,12 @@ const fragmentShader = /* glsl */`
     T = lenT > 1e-5 ? T / lenT : vec3(1.0, 0.0, 0.0);
     B = lenB > 1e-5 ? B / lenB : vec3(0.0, 1.0, 0.0);
 
-    // Bump strength normalised by screen-space position derivative so
-    // the effect is independent of zoom level.
+    // When vertex displacement is active, reduce bump strength: the macro shape
+    // is already physical; bump only adds sub-vertex fine detail.
     float posScale = max(length(dp1) + length(dp2), 1e-6);
-    float bumpStr  = amplitude * 6.0 / posScale;
+    float bumpStr  = useDisplacement == 1
+      ? amplitude * 2.0 / posScale
+      : amplitude * 6.0 / posScale;
 
     vec3 bumpVec = N - bumpStr * (dhx * T + dhy * B);
     vec3 bumpN = length(bumpVec) > 1e-6 ? normalize(bumpVec) : N;
@@ -293,6 +316,7 @@ export function updateMaterial(material, displacementTexture, settings) {
   u.mappingBlend.value            = settings.mappingBlend            ?? 0.0;
   u.seamBandWidth.value           = settings.seamBandWidth           ?? 0.35;
   u.symmetricDisplacement.value   = settings.symmetricDisplacement   ? 1 : 0;
+  u.useDisplacement.value         = settings.useDisplacement         ? 1 : 0;
 }
 
 // ── Internal ──────────────────────────────────────────────────────────────────
@@ -318,6 +342,7 @@ function buildUniforms(tex, settings) {
     mappingBlend:             { value: settings.mappingBlend            ?? 0.0 },
     seamBandWidth:            { value: settings.seamBandWidth            ?? 0.35 },
     symmetricDisplacement:    { value: settings.symmetricDisplacement   ? 1 : 0 },
+    useDisplacement:          { value: settings.useDisplacement         ? 1 : 0 },
   };
 }
 
