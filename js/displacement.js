@@ -177,12 +177,20 @@ export function applyDisplacement(geometry, imageData, imgWidth, imgHeight, sett
 
     const sn = smoothNrmMap.get(k);
 
-    // Cubic at sharp seams: zone-area-weighted sampling with a stable per-face dominant axis.
+    // Cubic: zone-area-weighted sampling with a stable per-face dominant axis.
     // Non-seam vertices use their single zone purely; seam-edge vertices that
     // adjoin two zones get a face-area-proportional blend.  This guarantees all
     // three vertices of every triangle receive consistent displacement, making
     // the mesh watertight with no mixed-projection artefact rows at the seam.
-    if (settings.mappingMode === 6 /* MODE_CUBIC */ && (settings.mappingBlend ?? 0) < 0.001) {
+    //
+    // Always use this path regardless of mappingBlend.  The smooth normals from
+    // subdivision can be wrong on thin structures (e.g. a flat base plate) where
+    // top (0,0,1) and bottom (0,0,-1) face normals cancel at shared edge vertices,
+    // leaving a horizontal smooth normal.  computeUV would then pick the wrong
+    // cubic projection axis, making those faces appear untextured.  The face-
+    // normal-based zoneAreaMap is immune to this because it classifies faces by
+    // their geometric cross-product normal, not the averaged vertex normal.
+    if (settings.mappingMode === 6 /* MODE_CUBIC */) {
       const za = zoneAreaMap.get(k);
       const total = za ? za[0] + za[1] + za[2] : 0;
       if (total > 0) {
