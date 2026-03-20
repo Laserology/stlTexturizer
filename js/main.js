@@ -31,7 +31,7 @@ let exclusionTool      = null;        // 'brush' | 'bucket' | null
 let eraseMode          = false;
 let brushIsRadius      = false;
 let brushRadius        = 5.0;
-let bucketThreshold    = 30;
+let bucketThreshold    = 20;
 let isPainting         = false;
 let selectionMode      = false;       // false = exclude painted faces; true = include only painted faces
 let _lastHoverTriIdx   = -1;          // last triangle index used for hover preview
@@ -415,7 +415,7 @@ function wireEvents() {
     _lastHoverTriIdx = -1; // invalidate hover so next mousemove re-computes
   });
   exclThresholdVal.addEventListener('change', () => {
-    bucketThreshold = Math.max(0, Math.min(180, parseFloat(exclThresholdVal.value) || 30));
+    bucketThreshold = Math.max(0, Math.min(180, parseFloat(exclThresholdVal.value) || 20));
     exclThresholdSlider.value = bucketThreshold;
     exclThresholdVal.value = bucketThreshold;
     _lastHoverTriIdx = -1;
@@ -758,7 +758,10 @@ function loadDefaultCube() {
 
   const triCount = getTriangleCount(geo);
   const mb = ((geo.attributes.position.array.byteLength) / 1024 / 1024).toFixed(2);
-  meshInfo.textContent = t('ui.meshInfo', { n: triCount.toLocaleString(), mb });
+  const sx = currentBounds.size.x.toFixed(2);
+  const sy = currentBounds.size.y.toFixed(2);
+  const sz = currentBounds.size.z.toFixed(2);
+  meshInfo.textContent = t('ui.meshInfo', { n: triCount.toLocaleString(), mb, sx, sy, sz });
 
   exportBtn.disabled = (activeMapEntry === null);
   updatePreview();
@@ -838,7 +841,10 @@ async function handleSTL(file) {
 
     const triCount = getTriangleCount(geometry);
     const mb = ((geometry.attributes.position.array.byteLength) / 1024 / 1024).toFixed(2);
-    meshInfo.textContent = t('ui.meshInfo', { n: triCount.toLocaleString(), mb });
+    const sx = bounds.size.x.toFixed(2);
+    const sy = bounds.size.y.toFixed(2);
+    const sz = bounds.size.z.toFixed(2);
+    meshInfo.textContent = t('ui.meshInfo', { n: triCount.toLocaleString(), mb, sx, sy, sz });
 
     exportBtn.disabled = (activeMapEntry === null);
     updatePreview();

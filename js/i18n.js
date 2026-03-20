@@ -15,7 +15,7 @@ export const TRANSLATIONS = {
     // Viewport footer
     'ui.wireframe':      'Wireframe',
     'ui.controlsHint':   'Left drag: orbit \u00a0·\u00a0 Right drag: pan \u00a0·\u00a0 Scroll: zoom',
-    'ui.meshInfo':       '{n} triangles · {mb} MB',
+    'ui.meshInfo':       '{n} triangles · {mb} MB · {sx} × {sy} × {sz} mm',
 
     // Load STL button
     'ui.loadStl':        'Load STL\u2026',
@@ -127,11 +127,9 @@ export const TRANSLATIONS = {
     // License popup
     'license.btn':    'License & Terms',
     'license.title':  'License & Terms',
-    'license.item1':  'This tool is <strong>open-source</strong> \u2014 <a href="https://github.com/CNCKitchen/stlTexturizer" target="_blank" rel="noopener">view &amp; contribute on GitHub</a>.',
-    'license.item2':  'Free to use for any purpose, including <strong>commercial work</strong> (e.g., texturing STLs for clients or products).',
-    'license.item3':  'Attribution is <strong>appreciated</strong> but <strong>not required</strong> when using this tool as-is.',
-    'license.item4':  'You may <strong>not</strong> sell or commercially redistribute this tool itself.',
-    'license.item5':  'Forks or derivative works must credit <strong>CNC Kitchen</strong> by name and link to <a href="https://cnckitchen.store" target="_blank" rel="noopener">cnckitchen.store</a>.',
+    'license.item1':  'Free to use for any purpose, including <strong>commercial work</strong> (e.g., texturing STLs for clients or products).',
+    'license.item2':  'Attribution is <strong>appreciated</strong> but <strong>not required</strong> when using this tool as-is.',
+    'license.item3':  'Want to support this tool and our work? Check out our <a href="https://geni.us/CNCStoreTexture" target="_blank" rel="noopener">online store</a>!',
 
     // Sponsor modal
     'sponsor.title':           'Thanks for using CNC Kitchen STL Texturizer!',
@@ -162,7 +160,7 @@ export const TRANSLATIONS = {
     // Viewport footer
     'ui.wireframe':      'Drahtgitter',
     'ui.controlsHint':   'Linke Maustaste: Drehen \u00a0·\u00a0 Rechte Maustaste: Verschieben \u00a0·\u00a0 Mausrad: Zoomen',
-    'ui.meshInfo':       '{n} Dreiecke · {mb} MB',
+    'ui.meshInfo':       '{n} Dreiecke · {mb} MB · {sx} × {sy} × {sz} mm',
 
     // Load STL button
     'ui.loadStl':        'STL laden\u2026',
@@ -274,11 +272,9 @@ export const TRANSLATIONS = {
     // License popup
     'license.btn':    'Lizenz & Nutzung',
     'license.title':  'Lizenz & Nutzungsbedingungen',
-    'license.item1':  'Dieses Tool ist <strong>Open Source</strong> \u2014 <a href="https://github.com/CNCKitchen/stlTexturizer" target="_blank" rel="noopener">auf GitHub ansehen &amp; beitragen</a>.',
-    'license.item2':  'Kostenlos nutzbar f\u00fcr jeden Zweck, auch f\u00fcr <strong>kommerzielle Arbeit</strong> (z.B. Texturierung von STLs f\u00fcr Kunden oder Produkte).',
-    'license.item3':  'Namensnennung wird <strong>gesch\u00e4tzt</strong>, ist aber bei der Nutzung dieses Tools <strong>nicht erforderlich</strong>.',
-    'license.item4':  'Das Tool selbst darf <strong>nicht</strong> verkauft oder kommerziell weitervertrieben werden.',
-    'license.item5':  'Forks oder abgeleitete Werke m\u00fcssen <strong>CNC Kitchen</strong> namentlich nennen und auf <a href="https://cnckitchen.store" target="_blank" rel="noopener">cnckitchen.store</a> verlinken.',
+    'license.item1':  'Kostenlos nutzbar f\u00fcr jeden Zweck, auch f\u00fcr <strong>kommerzielle Arbeit</strong> (z.B. Texturierung von STLs f\u00fcr Kunden oder Produkte).',
+    'license.item2':  'Namensnennung wird <strong>gesch\u00e4tzt</strong>, ist aber bei der Nutzung dieses Tools <strong>nicht erforderlich</strong>.',
+    'license.item3':  'M\u00f6chtest du dieses Tool und unsere Arbeit unterst\u00fctzen? Schau in unserem <a href="https://geni.us/CNCStoreTexture" target="_blank" rel="noopener">Online-Shop</a> vorbei!',
 
     // Sponsor modal
     'sponsor.title':           'Danke f\u00fcr die Nutzung des CNC Kitchen STL Texturizers!',

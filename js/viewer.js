@@ -24,17 +24,15 @@ function buildAxesIndicator(size) {
     const pts = [new THREE.Vector3(0, 0, 0), dir.clone().multiplyScalar(r * 0.78)];
     const line = new THREE.Line(
       new THREE.BufferGeometry().setFromPoints(pts),
-      new THREE.LineBasicMaterial({ color: hex, depthTest: false, transparent: true, opacity: 0.9 }),
+      new THREE.LineBasicMaterial({ color: hex, transparent: true, opacity: 0.9 }),
     );
-    line.renderOrder = 999;
     group.add(line);
 
     // Cone arrowhead
     const cone = new THREE.Mesh(
       new THREE.ConeGeometry(r * 0.07, r * 0.22, 8),
-      new THREE.MeshBasicMaterial({ color: hex, depthTest: false }),
+      new THREE.MeshBasicMaterial({ color: hex }),
     );
-    cone.renderOrder = 999;
     cone.position.copy(dir.clone().multiplyScalar(r * 0.89));
     cone.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), dir);
     group.add(cone);
@@ -49,9 +47,8 @@ function buildAxesIndicator(size) {
     ctx.textBaseline = 'middle';
     ctx.fillText(label, 32, 32);
     const sprite = new THREE.Sprite(
-      new THREE.SpriteMaterial({ map: new THREE.CanvasTexture(c), depthTest: false }),
+      new THREE.SpriteMaterial({ map: new THREE.CanvasTexture(c) }),
     );
-    sprite.renderOrder = 999;
     sprite.position.copy(dir.clone().multiplyScalar(r * 1.18));
     sprite.scale.set(r * 0.32, r * 0.32, 1);
     group.add(sprite);
@@ -79,9 +76,8 @@ function buildDimensionLabel(text, hex, worldW, worldH) {
   ctx.fillText(text, 128, 32);
   const mesh = new THREE.Mesh(
     new THREE.PlaneGeometry(worldW, worldH),
-    new THREE.MeshBasicMaterial({ map: new THREE.CanvasTexture(c), transparent: true, depthTest: false, side: THREE.DoubleSide }),
+    new THREE.MeshBasicMaterial({ map: new THREE.CanvasTexture(c), transparent: true, side: THREE.DoubleSide }),
   );
-  mesh.renderOrder = 998;
   return mesh;
 }
 
@@ -98,9 +94,8 @@ function buildDimensions(box, groundZ, scale) {
   const addLine = (pts, hex) => {
     const line = new THREE.Line(
       new THREE.BufferGeometry().setFromPoints(pts),
-      new THREE.LineBasicMaterial({ color: hex, depthTest: false, transparent: true, opacity: 0.75 }),
+      new THREE.LineBasicMaterial({ color: hex, transparent: true, opacity: 0.75 }),
     );
-    line.renderOrder = 997;
     group.add(line);
   };
 
