@@ -19,7 +19,7 @@ const SAFETY_CAP = 10_000_000; // absolute OOM guard
 
 // ── Public entry point ───────────────────────────────────────────────────────
 
-export async function subdivide(geometry, maxEdgeLength, onProgress, faceWeights = null) {
+export async function subdivide(geometry, maxEdgeLength, onProgress, faceWeights = null, { fast = false } = {}) {
   // Derive per-face exclusion BEFORE toIndexed so we use the untouched
   // non-indexed weights (toIndexed uses MAX-merge which can push boundary
   // vertices to weight 1.0 even on included triangles).
@@ -33,12 +33,24 @@ export async function subdivide(geometry, maxEdgeLength, onProgress, faceWeights
     }
   }
 
-  const { positions, normals, weights, indices } = toIndexed(geometry, faceWeights);
+  // Fast mode (preview): simple position-merge, index-based edge keys.
+  // Accurate mode (export): cluster-based sharp-edge splitting + canonIdx.
+  const indexed = fast
+    ? toIndexedFast(geometry, faceWeights)
+    : toIndexed(geometry, faceWeights);
+  const { positions, normals, weights, indices } = indexed;
+  const canonIdx    = indexed.canonIdx    || null;
+  const posCanonMap = indexed.posCanonMap || null;
 
   const maxIterations = 12;
   let currentIndices = indices;
   let currentFaceExcluded = initialFaceExcluded;
   let safetyCapHit = false;
+
+  // Track which original face each subdivided face descends from.
+  const initialTriCount = indices.length / 3;
+  let currentFaceParentId = new Array(initialTriCount);
+  for (let i = 0; i < initialTriCount; i++) currentFaceParentId[i] = i;
 
   for (let iter = 0; iter < maxIterations; iter++) {
     const triCount = currentIndices.length / 3;
@@ -47,11 +59,13 @@ export async function subdivide(geometry, maxEdgeLength, onProgress, faceWeights
       break;
     }
 
-    const { newIndices, newFaceExcluded, changed } = subdividePass(
-      positions, normals, weights, currentIndices, maxEdgeLength, SAFETY_CAP, currentFaceExcluded
+    const { newIndices, newFaceExcluded, newFaceParentId, changed } = subdividePass(
+      positions, normals, weights, currentIndices, maxEdgeLength, SAFETY_CAP, currentFaceExcluded,
+      canonIdx, posCanonMap, currentFaceParentId
     );
     currentIndices = newIndices;
     if (newFaceExcluded) currentFaceExcluded = newFaceExcluded;
+    if (newFaceParentId) currentFaceParentId = newFaceParentId;
 
     if (newIndices.length / 3 >= SAFETY_CAP) safetyCapHit = true;
 
@@ -60,7 +74,11 @@ export async function subdivide(geometry, maxEdgeLength, onProgress, faceWeights
     if (!changed || safetyCapHit) break;
   }
 
-  return { geometry: toNonIndexed(positions, normals, weights, currentIndices, currentFaceExcluded), safetyCapHit };
+  return {
+    geometry: toNonIndexed(positions, normals, weights, currentIndices, currentFaceExcluded),
+    safetyCapHit,
+    faceParentId: new Int32Array(currentFaceParentId),
+  };
 }
 
 // ── One subdivision pass ──────────────────────────────────────────────────────
@@ -84,20 +102,16 @@ export async function subdivide(geometry, maxEdgeLength, onProgress, faceWeights
 // long edge still produce chains of thin children (unavoidable without moving
 // vertices off the surface), but the mesh is now crack-free in all cases.
 
-function subdividePass(positions, normals, weights, indices, maxEdgeLength, safetyCap, faceExcluded = null) {
+function subdividePass(positions, normals, weights, indices, maxEdgeLength, safetyCap, faceExcluded = null, canonIdx = null, posCanonMap = null, faceParentId = null) {
   const maxSq = maxEdgeLength * maxEdgeLength;
   const midCache = new Map();
 
-  // Position-based edge key for split detection.  toIndexed() splits indexed
-  // vertices at sharp dihedral edges (>30°), so two faces sharing a geometric
-  // edge may reference different index pairs.  Using quantised positions as
-  // the key guarantees both sides see the same split decision, preventing
-  // T-junctions at the boundary between textured and angle-masked faces.
-  const _posEdgeKey = (a, b) => {
-    const ka = `${Math.round(positions[a*3]*QUANTISE)}_${Math.round(positions[a*3+1]*QUANTISE)}_${Math.round(positions[a*3+2]*QUANTISE)}`;
-    const kb = `${Math.round(positions[b*3]*QUANTISE)}_${Math.round(positions[b*3+1]*QUANTISE)}_${Math.round(positions[b*3+2]*QUANTISE)}`;
-    return ka < kb ? `${ka}|${kb}` : `${kb}|${ka}`;
-  };
+  // When canonIdx is available (accurate/export mode), use position-canonical
+  // edge keys so split-vertex faces on both sides of a sharp edge see the same
+  // split decision.  Otherwise (fast/preview mode) use simple index-based keys.
+  const _edgeKey = canonIdx
+    ? (a, b) => { const ca = canonIdx[a], cb = canonIdx[b]; return ca < cb ? `${ca}:${cb}` : `${cb}:${ca}`; }
+    : (a, b) => a < b ? `${a}:${b}` : `${b}:${a}`;
 
   // ── Step 1: globally mark edges that need splitting ─────────────────────
   // Excluded triangles do NOT proactively mark their own edges – their
@@ -108,16 +122,17 @@ function subdividePass(positions, normals, weights, indices, maxEdgeLength, safe
   for (let t = 0; t < indices.length; t += 3) {
     if (faceExcluded && faceExcluded[t / 3]) continue; // skip excluded faces
     const a = indices[t], b = indices[t + 1], c = indices[t + 2];
-    if (edgeLenSq(positions, a, b) > maxSq) splitEdges.add(_posEdgeKey(a, b));
-    if (edgeLenSq(positions, b, c) > maxSq) splitEdges.add(_posEdgeKey(b, c));
-    if (edgeLenSq(positions, c, a) > maxSq) splitEdges.add(_posEdgeKey(c, a));
+    if (edgeLenSq(positions, a, b) > maxSq) splitEdges.add(_edgeKey(a, b));
+    if (edgeLenSq(positions, b, c) > maxSq) splitEdges.add(_edgeKey(b, c));
+    if (edgeLenSq(positions, c, a) > maxSq) splitEdges.add(_edgeKey(c, a));
   }
 
-  if (splitEdges.size === 0) return { newIndices: indices, newFaceExcluded: faceExcluded, changed: false };
+  if (splitEdges.size === 0) return { newIndices: indices, newFaceExcluded: faceExcluded, newFaceParentId: faceParentId, changed: false };
 
   // ── Step 2: rebuild index list ───────────────────────────────────────────
   const nextIndices = [];
   const nextFaceExcluded = faceExcluded ? [] : null;
+  const nextFaceParentId = faceParentId ? [] : null;
 
   for (let t = 0; t < indices.length; t += 3) {
     // Safety cap: stop splitting, carry remaining triangles as-is
@@ -127,21 +142,26 @@ function subdividePass(positions, normals, weights, indices, maxEdgeLength, safe
       if (nextFaceExcluded && faceExcluded) {
         for (let r = t / 3; r < indices.length / 3; r++) nextFaceExcluded.push(faceExcluded[r]);
       }
+      if (nextFaceParentId && faceParentId) {
+        for (let r = t / 3; r < indices.length / 3; r++) nextFaceParentId.push(faceParentId[r]);
+      }
       break;
     }
 
     const a = indices[t], b = indices[t + 1], c = indices[t + 2];
     const fIdx = t / 3;
     const excl = faceExcluded ? faceExcluded[fIdx] : 0;
-    const sAB = splitEdges.has(_posEdgeKey(a, b));
-    const sBC = splitEdges.has(_posEdgeKey(b, c));
-    const sCA = splitEdges.has(_posEdgeKey(c, a));
+    const pid  = faceParentId ? faceParentId[fIdx] : 0;
+    const sAB = splitEdges.has(_edgeKey(a, b));
+    const sBC = splitEdges.has(_edgeKey(b, c));
+    const sCA = splitEdges.has(_edgeKey(c, a));
     const n   = (sAB ? 1 : 0) + (sBC ? 1 : 0) + (sCA ? 1 : 0);
 
     if (n === 0) {
       // ── 0-split: keep triangle ─────────────────────────────────────────
       nextIndices.push(a, b, c);
       if (nextFaceExcluded) nextFaceExcluded.push(excl);
+      if (nextFaceParentId) nextFaceParentId.push(pid);
 
     } else if (n === 3) {
       // ── 3-split: 1→4 regular midpoint subdivision ──────────────────────
@@ -152,9 +172,9 @@ function subdividePass(positions, normals, weights, indices, maxEdgeLength, safe
       //     / \ / \
       //    c─mBC───b
       //
-      const mAB = getMidpoint(positions, normals, weights, midCache, a, b);
-      const mBC = getMidpoint(positions, normals, weights, midCache, b, c);
-      const mCA = getMidpoint(positions, normals, weights, midCache, c, a);
+      const mAB = getMidpoint(positions, normals, weights, midCache, a, b, canonIdx, posCanonMap);
+      const mBC = getMidpoint(positions, normals, weights, midCache, b, c, canonIdx, posCanonMap);
+      const mCA = getMidpoint(positions, normals, weights, midCache, c, a, canonIdx, posCanonMap);
       nextIndices.push(
         a,   mAB, mCA,
         mAB, b,   mBC,
@@ -162,21 +182,25 @@ function subdividePass(positions, normals, weights, indices, maxEdgeLength, safe
         mAB, mBC, mCA,
       );
       if (nextFaceExcluded) nextFaceExcluded.push(excl, excl, excl, excl);
+      if (nextFaceParentId) nextFaceParentId.push(pid, pid, pid, pid);
 
     } else if (n === 1) {
       // ── 1-split: bisect the one marked edge → 2 sub-triangles ──────────
       if (sAB) {
-        const m = getMidpoint(positions, normals, weights, midCache, a, b);
+        const m = getMidpoint(positions, normals, weights, midCache, a, b, canonIdx, posCanonMap);
         nextIndices.push(a, m, c,  m, b, c);
         if (nextFaceExcluded) nextFaceExcluded.push(excl, excl);
+        if (nextFaceParentId) nextFaceParentId.push(pid, pid);
       } else if (sBC) {
-        const m = getMidpoint(positions, normals, weights, midCache, b, c);
+        const m = getMidpoint(positions, normals, weights, midCache, b, c, canonIdx, posCanonMap);
         nextIndices.push(a, b, m,  a, m, c);
         if (nextFaceExcluded) nextFaceExcluded.push(excl, excl);
+        if (nextFaceParentId) nextFaceParentId.push(pid, pid);
       } else {                           // sCA
-        const m = getMidpoint(positions, normals, weights, midCache, c, a);
+        const m = getMidpoint(positions, normals, weights, midCache, c, a, canonIdx, posCanonMap);
         nextIndices.push(a, b, m,  m, b, c);
         if (nextFaceExcluded) nextFaceExcluded.push(excl, excl);
+        if (nextFaceParentId) nextFaceParentId.push(pid, pid);
       }
 
     } else {
@@ -188,37 +212,40 @@ function subdividePass(positions, normals, weights, indices, maxEdgeLength, safe
       // opposite vertices, preserving consistent CCW winding throughout.
 
       if (!sAB) {                        // sBC + sCA: fan from C
-        const mBC = getMidpoint(positions, normals, weights, midCache, b, c);
-        const mCA = getMidpoint(positions, normals, weights, midCache, c, a);
+        const mBC = getMidpoint(positions, normals, weights, midCache, b, c, canonIdx, posCanonMap);
+        const mCA = getMidpoint(positions, normals, weights, midCache, c, a, canonIdx, posCanonMap);
         nextIndices.push(
           a,   b,   mBC,
           a,   mBC, mCA,
           c,   mCA, mBC,
         );
         if (nextFaceExcluded) nextFaceExcluded.push(excl, excl, excl);
+        if (nextFaceParentId) nextFaceParentId.push(pid, pid, pid);
       } else if (!sBC) {                 // sAB + sCA: fan from A
-        const mAB = getMidpoint(positions, normals, weights, midCache, a, b);
-        const mCA = getMidpoint(positions, normals, weights, midCache, c, a);
+        const mAB = getMidpoint(positions, normals, weights, midCache, a, b, canonIdx, posCanonMap);
+        const mCA = getMidpoint(positions, normals, weights, midCache, c, a, canonIdx, posCanonMap);
         nextIndices.push(
           a,   mAB, mCA,
           mAB, b,   c,
           mAB, c,   mCA,
         );
         if (nextFaceExcluded) nextFaceExcluded.push(excl, excl, excl);
+        if (nextFaceParentId) nextFaceParentId.push(pid, pid, pid);
       } else {                           // sAB + sBC: fan from B
-        const mAB = getMidpoint(positions, normals, weights, midCache, a, b);
-        const mBC = getMidpoint(positions, normals, weights, midCache, b, c);
+        const mAB = getMidpoint(positions, normals, weights, midCache, a, b, canonIdx, posCanonMap);
+        const mBC = getMidpoint(positions, normals, weights, midCache, b, c, canonIdx, posCanonMap);
         nextIndices.push(
           b,   mBC, mAB,
           a,   mAB, mBC,
           a,   mBC, c,
         );
         if (nextFaceExcluded) nextFaceExcluded.push(excl, excl, excl);
+        if (nextFaceParentId) nextFaceParentId.push(pid, pid, pid);
       }
     }
   }
 
-  return { newIndices: nextIndices, newFaceExcluded: nextFaceExcluded, changed: true };
+  return { newIndices: nextIndices, newFaceExcluded: nextFaceExcluded, newFaceParentId: nextFaceParentId, changed: true };
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -235,7 +262,7 @@ function edgeLenSq(pos, a, b) {
   return dx*dx + dy*dy + dz*dz;
 }
 
-function getMidpoint(positions, normals, weights, cache, a, b) {
+function getMidpoint(positions, normals, weights, cache, a, b, canonIdx, posCanonMap) {
   const key = a < b ? `${a}:${b}` : `${b}:${a}`;
   if (cache.has(key)) return cache.get(key);
 
@@ -253,15 +280,80 @@ function getMidpoint(positions, normals, weights, cache, a, b) {
   const idx = (positions.length / 3) | 0;
   positions.push(mx, my, mz);
   normals.push(nx / nl, ny / nl, nz / nl);
-  // Interpolate exclusion weight: 0 = included, 1 = excluded.
-  // A midpoint between two excluded vertices → 1.0; between mixed → 0.5
-  // (displacement.js treats > 0.5 average as excluded for the face).
   if (weights) weights.push((weights[a] + weights[b]) / 2);
+
+  // Maintain canonIdx when in accurate (export) mode.
+  if (canonIdx) {
+    const pk = `${Math.round(mx * QUANTISE)}_${Math.round(my * QUANTISE)}_${Math.round(mz * QUANTISE)}`;
+    let cid = posCanonMap.get(pk);
+    if (cid === undefined) {
+      cid = idx;
+      posCanonMap.set(pk, cid);
+    }
+    canonIdx.push(cid);
+  }
+
   cache.set(key, idx);
   return idx;
 }
 
-// ── Non-indexed → indexed conversion ────────────────────────────────────────
+// ── Fast non-indexed → indexed (preview path) ──────────────────────────────
+// Simple position-only merge — no cluster detection, no sharp-edge splitting.
+// Much faster than toIndexed() on high-poly meshes like the 3DBenchy.
+
+function toIndexedFast(geometry, nonIndexedWeights = null) {
+  const posAttr = geometry.attributes.position;
+  const nrmAttr = geometry.attributes.normal;
+  const positions  = [];
+  const normals    = [];
+  const normalSums = [];
+  const weights    = nonIndexedWeights ? [] : null;
+  const indices    = [];
+  const vertMap    = new Map();
+
+  const n = posAttr.count;
+  for (let i = 0; i < n; i++) {
+    const px = posAttr.getX(i);
+    const py = posAttr.getY(i);
+    const pz = posAttr.getZ(i);
+    const nx_ = nrmAttr ? nrmAttr.getX(i) : 0;
+    const ny_ = nrmAttr ? nrmAttr.getY(i) : 0;
+    const nz_ = nrmAttr ? nrmAttr.getZ(i) : 1;
+
+    const key = `${Math.round(px * QUANTISE)}_${Math.round(py * QUANTISE)}_${Math.round(pz * QUANTISE)}`;
+    let idx = vertMap.get(key);
+    if (idx === undefined) {
+      idx = positions.length / 3;
+      positions.push(px, py, pz);
+      normals.push(nx_, ny_, nz_);
+      normalSums.push(nx_, ny_, nz_);
+      if (weights) weights.push(nonIndexedWeights[i]);
+      vertMap.set(key, idx);
+    } else {
+      normalSums[idx * 3]     += nx_;
+      normalSums[idx * 3 + 1] += ny_;
+      normalSums[idx * 3 + 2] += nz_;
+      if (weights && nonIndexedWeights[i] > weights[idx]) {
+        weights[idx] = nonIndexedWeights[i];
+      }
+    }
+    indices.push(idx);
+  }
+
+  for (let i = 0; i < positions.length / 3; i++) {
+    const nx = normalSums[i * 3];
+    const ny = normalSums[i * 3 + 1];
+    const nz = normalSums[i * 3 + 2];
+    const len = Math.sqrt(nx * nx + ny * ny + nz * nz) || 1;
+    normals[i * 3]     = nx / len;
+    normals[i * 3 + 1] = ny / len;
+    normals[i * 3 + 2] = nz / len;
+  }
+
+  return { positions, normals, weights, indices };
+}
+
+// ── Non-indexed → indexed conversion (export path) ──────────────────────────
 
 // nonIndexedWeights: optional Float32Array(vertexCount) where vertex i has
 // weight = 1.0 if its triangle (floor(i/3)) is user-excluded, else 0.
@@ -308,7 +400,9 @@ function toIndexed(geometry, nonIndexedWeights = null) {
   const normalSums = [];
   const weights    = nonIndexedWeights ? [] : null;
   const indices    = [];
-  const vertMap    = new Map(); // posKey → [{idx, fnU: [x,y,z]}]
+  const canonIdx   = [];            // vertex idx → canonical position ID
+  const posCanonMap = new Map();    // posKey → first vertex idx at that position
+  const vertMap    = new Map();     // posKey → [{idx, fnU: [x,y,z]}]
 
   for (let i = 0; i < n; i++) {
     const px = posAttr.getX(i);
@@ -318,6 +412,7 @@ function toIndexed(geometry, nonIndexedWeights = null) {
     const fnRx = faceNrmRaw[i*3],  fnRy = faceNrmRaw[i*3+1],  fnRz = faceNrmRaw[i*3+2];
 
     const key = `${Math.round(px * QUANTISE)}_${Math.round(py * QUANTISE)}_${Math.round(pz * QUANTISE)}`;
+    let canonId = posCanonMap.get(key);
     const clusters = vertMap.get(key);
     if (clusters) {
       let matched = false;
@@ -332,6 +427,15 @@ function toIndexed(geometry, nonIndexedWeights = null) {
           if (weights && nonIndexedWeights[i] > weights[idx]) {
             weights[idx] = nonIndexedWeights[i];
           }
+          // Update the cluster representative to the running average direction
+          // so gradual curvature on smooth surfaces (benchy hull, cylinders)
+          // stays in one cluster instead of fragmenting when faces far from the
+          // seed happen to exceed 30° from the seed's fixed normal.
+          cl.fnU[0] += fnUx;
+          cl.fnU[1] += fnUy;
+          cl.fnU[2] += fnUz;
+          const rl = Math.sqrt(cl.fnU[0]*cl.fnU[0] + cl.fnU[1]*cl.fnU[1] + cl.fnU[2]*cl.fnU[2]) || 1;
+          cl.fnU[0] /= rl; cl.fnU[1] /= rl; cl.fnU[2] /= rl;
           indices.push(idx);
           matched = true;
           break;
@@ -344,6 +448,7 @@ function toIndexed(geometry, nonIndexedWeights = null) {
         normals.push(fnRx, fnRy, fnRz);
         normalSums.push(fnRx, fnRy, fnRz);
         if (weights) weights.push(nonIndexedWeights[i]);
+        canonIdx.push(canonId);  // same canonical position ID
         clusters.push({idx, fnU: [fnUx, fnUy, fnUz]});
         indices.push(idx);
       }
@@ -353,6 +458,9 @@ function toIndexed(geometry, nonIndexedWeights = null) {
       normals.push(fnRx, fnRy, fnRz);
       normalSums.push(fnRx, fnRy, fnRz);
       if (weights) weights.push(nonIndexedWeights[i]);
+      canonId = idx;                  // first vertex at this position is canonical
+      posCanonMap.set(key, canonId);
+      canonIdx.push(canonId);
       vertMap.set(key, [{idx, fnU: [fnUx, fnUy, fnUz]}]);
       indices.push(idx);
     }
@@ -368,7 +476,7 @@ function toIndexed(geometry, nonIndexedWeights = null) {
     normals[i * 3 + 2] = nz / len;
   }
 
-  return { positions, normals, weights, indices };
+  return { positions, normals, weights, indices, canonIdx, posCanonMap };
 }
 
 // ── Indexed → non-indexed ────────────────────────────────────────────────────

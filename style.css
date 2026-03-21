@@ -671,6 +671,13 @@ input[type="number"].val:focus { outline: none; border-color: var(--accent); }
   color: var(--accent);
 }
 
+.excl-shift-hint {
+  font-size: 10px;
+  color: var(--text-muted);
+  margin: -4px 0 8px;
+  text-align: center;
+}
+
 /* Segmented button group (Single / Radius) */
 .excl-seg {
   display: flex;
@@ -720,7 +727,13 @@ input[type="number"].val:focus { outline: none; border-color: var(--accent); }
   display: flex;
   align-items: center;
   justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 4px;
   margin-top: 10px;
+}
+
+.excl-footer .excl-shift-hint {
+  margin: 0;
 }
 
 .excl-count {

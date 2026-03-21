@@ -115,7 +115,6 @@ const dispPreviewToggle      = document.getElementById('displacement-preview');
 // ── Exclusion panel DOM refs ──────────────────────────────────────────────────
 const exclBrushBtn        = document.getElementById('excl-brush-btn');
 const exclBucketBtn       = document.getElementById('excl-bucket-btn');
-const exclEraseToggle     = document.getElementById('excl-erase-toggle');
 const exclBrushTypeRow    = document.getElementById('excl-brush-type-row');
 const exclBrushSingleBtn  = document.getElementById('excl-brush-single');
 const exclBrushRadiusBtn  = document.getElementById('excl-brush-radius-btn');
@@ -377,10 +376,12 @@ function wireEvents() {
   exclBrushBtn.addEventListener('click', () => setExclusionTool('brush'));
   exclBucketBtn.addEventListener('click', () => setExclusionTool('bucket'));
 
-  exclEraseToggle.addEventListener('click', () => {
-    eraseMode = !eraseMode;
-    exclEraseToggle.classList.toggle('active', eraseMode);
-    exclEraseToggle.setAttribute('aria-pressed', String(eraseMode));
+  // Shift key toggles erase mode
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Shift' && exclusionTool) eraseMode = true;
+  });
+  document.addEventListener('keyup', (e) => {
+    if (e.key === 'Shift') eraseMode = false;
   });
 
   exclBrushSingleBtn.addEventListener('click', () => {
@@ -401,13 +402,14 @@ function wireEvents() {
   });
 
   exclBrushRadiusSlider.addEventListener('input', () => {
-    brushRadius = parseFloat(exclBrushRadiusSlider.value);
-    exclBrushRadiusVal.value = brushRadius;
+    brushRadius = parseFloat(exclBrushRadiusSlider.value) / 2;
+    exclBrushRadiusVal.value = parseFloat(exclBrushRadiusSlider.value);
   });
   exclBrushRadiusVal.addEventListener('change', () => {
-    brushRadius = Math.max(0.1, Math.min(50, parseFloat(exclBrushRadiusVal.value) || 5));
-    exclBrushRadiusSlider.value = brushRadius;
-    exclBrushRadiusVal.value = brushRadius;
+    let diam = Math.max(0.2, Math.min(100, parseFloat(exclBrushRadiusVal.value) || 10));
+    brushRadius = diam / 2;
+    exclBrushRadiusSlider.value = diam;
+    exclBrushRadiusVal.value = diam;
   });
 
   exclThresholdSlider.addEventListener('input', () => {
@@ -433,11 +435,11 @@ function wireEvents() {
   // ── Canvas mouse events for exclusion painting ────────────────────────────
   canvas.addEventListener('mousedown', (e) => {
     if (!currentGeometry || !exclusionTool || e.button !== 0) return;
-    e.preventDefault();
-    getControls().enabled = false;
-    isPainting = true;
 
     if (exclusionTool === 'bucket') {
+      e.preventDefault();
+      _lastHoverTriIdx = -1;
+      setHoverPreview(null);
       const triIdx = pickTriangle(e);
       if (triIdx >= 0) {
         const filled = bucketFill(triIdx, triangleAdjacency, bucketThreshold);
@@ -445,13 +447,18 @@ function wireEvents() {
           if (eraseMode) excludedFaces.delete(t); else excludedFaces.add(t);
         }
         refreshExclusionOverlay();
-        // Clear hover immediately so the confirmed orange overlay is fully visible
         _lastHoverTriIdx = -1;
         setHoverPreview(null);
       }
-      isPainting = false;
-      getControls().enabled = true;
     } else {
+      // Brush mode: only start painting if we actually hit the mesh
+      const triIdx = pickTriangle(e);
+      if (triIdx < 0) return;          // miss → let OrbitControls handle the drag
+      e.preventDefault();
+      getControls().enabled = false;
+      isPainting = true;
+      _lastHoverTriIdx = -1;
+      setHoverPreview(null);
       paintAt(e);
     }
   });
@@ -463,6 +470,9 @@ function wireEvents() {
     if (isPainting && exclusionTool === 'brush') {
       paintAt(e);
       return;
+    }
+    if (!isPainting && exclusionTool === 'brush' && currentGeometry) {
+      updateBrushHover(e);
     }
     if (!isPainting && exclusionTool === 'bucket' && currentGeometry) {
       updateBucketHover(e);
@@ -498,7 +508,8 @@ function setSelectionMode(include) {
   exclModeIncludeBtn.classList.toggle('active', selectionMode);
   exclModeExcludeBtn.setAttribute('aria-pressed', String(!selectionMode));
   exclModeIncludeBtn.setAttribute('aria-pressed', String(selectionMode));
-  exclSectionHeading.textContent = selectionMode ? t('sections.surfaceSelection') : t('sections.surfaceExclusions');
+  if (exclusionTool) setExclusionTool(null);
+  exclSectionHeading.textContent = selectionMode ? t('sections.surfaceSelection') : t('sections.surfaceMasking');
   exclHint.textContent = selectionMode
     ? t('excl.hintInclude')
     : t('excl.hintExclude');
@@ -510,6 +521,13 @@ function setSelectionMode(include) {
 function setExclusionTool(tool) {
   // Clicking the active tool toggles it off; passing null always deactivates
   exclusionTool = (exclusionTool === tool) ? null : tool;
+
+  // Exit 3D displacement preview when a masking tool is activated
+  if (exclusionTool && settings.useDisplacement) {
+    settings.useDisplacement = false;
+    dispPreviewToggle.checked = false;
+    toggleDisplacementPreview(false);
+  }
   exclBrushBtn.classList.toggle('active', exclusionTool === 'brush');
   exclBucketBtn.classList.toggle('active', exclusionTool === 'bucket');
   // Show brush-type row only while brush is active
@@ -588,7 +606,7 @@ function paintAt(e) {
   }
 
   if (brushIsRadius) {
-    const hitPt    = hits[0].point;
+    const hitPt    = hit.point;
     const triCount = triangleCentroids.length / 3;
     const r2 = brushRadius * brushRadius;
     for (let t = 0; t < triCount; t++) {
@@ -637,9 +655,10 @@ function updateBrushCursor(e) {
   if (!mesh) { brushCursorEl.style.display = 'none'; return; }
   _raycaster.setFromCamera(_canvasNDC(e), getCamera());
   const hits = _raycaster.intersectObject(mesh);
-  if (hits.length === 0) { brushCursorEl.style.display = 'none'; return; }
+  const frontHit = getFrontFaceHit(hits, mesh);
+  if (!frontHit) { brushCursorEl.style.display = 'none'; return; }
 
-  const hitPt = hits[0].point;
+  const hitPt = frontHit.point;
   const cam   = getCamera();
 
   // Offset the hit point by brushRadius along the camera's right axis
@@ -666,6 +685,39 @@ function updateBrushCursor(e) {
   brushCursorEl.style.top     = `${rect.top  + sc.y - screenRadius}px`;
   brushCursorEl.style.width   = `${diam}px`;
   brushCursorEl.style.height  = `${diam}px`;
+}
+
+function updateBrushHover(e) {
+  const mesh = getCurrentMesh();
+  if (!mesh) { setHoverPreview(null); return; }
+  _raycaster.setFromCamera(_canvasNDC(e), getCamera());
+  const hits = _raycaster.intersectObject(mesh);
+  const hit = getFrontFaceHit(hits, mesh);
+  if (!hit) { _lastHoverTriIdx = -1; setHoverPreview(null); return; }
+
+  let triIdx = hit.faceIndex;
+  if (dispPreviewGeometry && mesh.geometry === dispPreviewGeometry && dispPreviewParentMap) {
+    triIdx = dispPreviewParentMap[triIdx];
+  }
+  if (triIdx === _lastHoverTriIdx) return;
+  _lastHoverTriIdx = triIdx;
+
+  if (brushIsRadius) {
+    const hitPt = hit.point;
+    const triCount = triangleCentroids.length / 3;
+    const r2 = brushRadius * brushRadius;
+    const hovered = new Set();
+    for (let t = 0; t < triCount; t++) {
+      const dx = triangleCentroids[t * 3]     - hitPt.x;
+      const dy = triangleCentroids[t * 3 + 1] - hitPt.y;
+      const dz = triangleCentroids[t * 3 + 2] - hitPt.z;
+      if (dx * dx + dy * dy + dz * dz <= r2) hovered.add(t);
+    }
+    setHoverPreview(buildExclusionOverlayGeo(currentGeometry, hovered));
+  } else {
+    const hovered = new Set([triIdx]);
+    setHoverPreview(buildExclusionOverlayGeo(currentGeometry, hovered));
+  }
 }
 
 function updateBucketHover(e) {
@@ -749,7 +801,6 @@ function loadDefaultCube() {
   isPainting        = false;
   exclBrushBtn.classList.remove('active');
   exclBucketBtn.classList.remove('active');
-  exclEraseToggle.classList.remove('active');
   exclBrushTypeRow.classList.add('hidden');
   exclRadiusRow.classList.add('hidden');
   exclThresholdRow.classList.add('hidden');
@@ -825,7 +876,6 @@ async function handleSTL(file) {
     isPainting        = false;
     exclBrushBtn.classList.remove('active');
     exclBucketBtn.classList.remove('active');
-    exclEraseToggle.classList.remove('active');
     exclBrushTypeRow.classList.add('hidden');
     exclRadiusRow.classList.add('hidden');
     exclThresholdRow.classList.add('hidden');
@@ -1228,8 +1278,8 @@ async function toggleDisplacementPreview(enable) {
 
     await yieldFrame();
 
-    const { geometry: subdivided } = await subdivide(
-      currentGeometry, previewEdge, null, null
+    const { geometry: subdivided, faceParentId } = await subdivide(
+      currentGeometry, previewEdge, null, null, { fast: true }
     );
 
     addSmoothNormals(subdivided);
@@ -1239,8 +1289,8 @@ async function toggleDisplacementPreview(enable) {
     if (dispPreviewGeometry) dispPreviewGeometry.dispose();
     dispPreviewGeometry = subdivided;
 
-    // Build mapping from subdivided faces → original faces for exclusion masking
-    dispPreviewParentMap = buildParentFaceMap(subdivided);
+    // Use the face parent IDs tracked through subdivision (O(n) instead of spatial search)
+    dispPreviewParentMap = faceParentId;
     updateFaceMask(subdivided);
 
     // Force material recreation so it binds the new geometry with smoothNormal
