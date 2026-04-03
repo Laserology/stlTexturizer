@@ -819,6 +819,77 @@ input[type="number"].val:focus { outline: none; border-color: var(--accent); }
 /* Hide utility (used by JS to show/hide exclusion sub-rows) */
 .form-row.hidden { display: none; }
 
+/* ── Precision masking ───────────────────────────────────────────────── */
+.precision-masking-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 10px;
+}
+
+.precision-masking-row.hidden { display: none; }
+
+.precision-label {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--text);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.precision-label input[type="checkbox"] {
+  margin: 0;
+}
+
+.precision-status {
+  font-size: 10px;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.precision-outdated {
+  font-size: 10px;
+  color: #f59e0b;
+  white-space: nowrap;
+}
+
+.precision-outdated.hidden { display: none; }
+
+.precision-refresh-btn {
+  padding: 2px 6px;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text-muted);
+  font-size: 12px;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s, color 0.15s;
+  line-height: 1;
+}
+
+.precision-refresh-btn:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.precision-refresh-btn.hidden { display: none; }
+
+.precision-warning {
+  background: color-mix(in srgb, #f59e0b 15%, var(--surface2));
+  border: 1px solid #f59e0b;
+  color: #f59e0b;
+  border-radius: var(--radius);
+  padding: 6px 10px;
+  font-size: 11px;
+  line-height: 1.4;
+  margin-bottom: 8px;
+}
+
+.precision-warning.hidden { display: none; }
+
 /* ── Sponsor / popup overlay ─────────────────────────────────────────── */
 .sponsor-overlay {
   position: fixed;

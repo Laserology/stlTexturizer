@@ -97,6 +97,15 @@ export const TRANSLATIONS = {
     'excl.hintExclude':              'Masked surfaces appear orange and will not receive displacement during export.',
     'excl.hintInclude':              'Selected surfaces appear green and will be the only ones to receive displacement during export.',
 
+    // Precision masking
+    'precision.label':               'Precision (Beta) \u24d8',
+    'precision.labelTitle':          'Subdivide mesh in the background so the brush selects at finer granularity',
+    'precision.outdated':            '\u26a0 Outdated',
+    'precision.refreshTitle':        'Re-subdivide mesh to match current brush size',
+    'precision.triCount':            '{n} \u25b3',
+    'precision.refining':            'Refining\u2026',
+    'precision.warningBody':         'Estimated ~{n} triangles. This may slow down your browser. Continue?',
+
     // Symmetric displacement
     'labels.symmetricDisplacement':  'Symmetric displacement \u24d8',
     'tooltips.symmetricDisplacement':'When on, 50% grey = no displacement; white pushes out, black pushes in. Keeps part volume roughly constant.',
@@ -255,6 +264,15 @@ export const TRANSLATIONS = {
     'excl.facesSelected':            '{n} Fl\u00e4chen ausgew\u00e4hlt',
     'excl.hintExclude':              'Maskierte Fl\u00e4chen erscheinen orange und erhalten beim Export keine Verschiebung.',
     'excl.hintInclude':              'Ausgew\u00e4hlte Fl\u00e4chen erscheinen gr\u00fcn und sind die einzigen, die beim Export eine Verschiebung erhalten.',
+
+    // Precision masking
+    'precision.label':               'Pr\u00e4zision (Beta) \u24d8',
+    'precision.labelTitle':          'Netz im Hintergrund unterteilen, damit der Pinsel feiner ausw\u00e4hlen kann',
+    'precision.outdated':            '\u26a0 Veraltet',
+    'precision.refreshTitle':        'Netz erneut unterteilen, um zur aktuellen Pinselgr\u00f6\u00dfe zu passen',
+    'precision.triCount':            '{n} \u25b3',
+    'precision.refining':            'Wird verfeinert\u2026',
+    'precision.warningBody':         'Gesch\u00e4tzt ~{n} Dreiecke. Dies kann den Browser verlangsamen. Fortfahren?',
 
     // Symmetric displacement
     'labels.symmetricDisplacement':  'Symmetrische Verschiebung \u24d8',

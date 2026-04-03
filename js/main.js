@@ -131,6 +131,17 @@ function blurCanvas(canvas, sigma) {
   }
 }
 
+// ── Precision masking state ────────────────────────────────────────────────────
+let precisionMaskingEnabled = false;
+let precisionGeometry       = null;   // subdivided geometry for finer masking
+let precisionParentMap      = null;   // Int32Array: refined face → original face index
+let precisionEdgeLength     = null;   // edge length used for current refinement
+let precisionBusy           = false;  // true while async subdivision is running
+let precisionCentroids      = null;   // Float32Array from buildAdjacency on refined mesh
+let precisionBoundRadii     = null;   // Float32Array — max vertex-to-centroid per refined tri
+let precisionAdjacency      = null;   // Map from buildAdjacency on refined mesh
+let precisionExcludedFaces  = new Set(); // precision face indices excluded while precision is active
+
 // ── Displacement preview state ────────────────────────────────────────────────
 let dispPreviewGeometry  = null;   // subdivided geometry with smoothNormal attribute
 let dispPreviewBusy      = false;  // true while async subdivision is running
@@ -211,6 +222,14 @@ const exclModeExcludeBtn  = document.getElementById('excl-mode-exclude');
 const exclModeIncludeBtn  = document.getElementById('excl-mode-include');
 const exclSectionHeading  = document.getElementById('excl-section-heading');
 const exclHint            = document.getElementById('excl-hint');
+
+// ── Precision masking DOM refs ────────────────────────────────────────────────
+const precisionMaskingRow     = document.getElementById('precision-masking-row');
+const precisionMaskingToggle  = document.getElementById('precision-masking-toggle');
+const precisionStatus         = document.getElementById('precision-status');
+const precisionOutdated       = document.getElementById('precision-outdated');
+const precisionRefreshBtn     = document.getElementById('precision-refresh-btn');
+const precisionWarning        = document.getElementById('precision-warning');
 
 // ── License panel DOM refs ────────────────────────────────────────────────────
 const licenseLink    = document.getElementById('license-link');
@@ -496,6 +515,9 @@ function wireEvents() {
     exclBrushSingleBtn.classList.add('active');
     exclBrushRadiusBtn.classList.remove('active');
     exclRadiusRow.classList.add('hidden');
+    precisionMaskingRow.classList.add('hidden');
+    // Deactivate precision when switching away from circle mode
+    if (precisionMaskingEnabled) deactivatePrecisionMasking();
     canvas.style.cursor = exclusionTool ? 'crosshair' : '';
     brushCursorEl.style.display = 'none';
   });
@@ -505,23 +527,27 @@ function wireEvents() {
     exclBrushRadiusBtn.classList.add('active');
     exclBrushSingleBtn.classList.remove('active');
     if (exclusionTool === 'brush') exclRadiusRow.classList.remove('hidden');
+    if (exclusionTool === 'brush') precisionMaskingRow.classList.remove('hidden');
     if (exclusionTool === 'brush') canvas.style.cursor = 'none';
   });
 
   exclBrushRadiusSlider.addEventListener('input', () => {
     brushRadius = parseFloat(exclBrushRadiusSlider.value) / 2;
     exclBrushRadiusVal.value = parseFloat(exclBrushRadiusSlider.value);
+    checkPrecisionOutdated();
   });
   exclBrushRadiusSlider.addEventListener('dblclick', () => {
     exclBrushRadiusSlider.value = exclBrushRadiusSlider.defaultValue;
     brushRadius = parseFloat(exclBrushRadiusSlider.value) / 2;
     exclBrushRadiusVal.value = parseFloat(exclBrushRadiusSlider.value);
+    checkPrecisionOutdated();
   });
   exclBrushRadiusVal.addEventListener('change', () => {
     let diam = Math.max(0.2, Math.min(100, parseFloat(exclBrushRadiusVal.value) || 10));
     brushRadius = diam / 2;
     exclBrushRadiusSlider.value = diam;
     exclBrushRadiusVal.value = diam;
+    checkPrecisionOutdated();
   });
 
   exclThresholdSlider.addEventListener('input', () => {
@@ -544,11 +570,20 @@ function wireEvents() {
 
   exclClearBtn.addEventListener('click', () => {
     excludedFaces = new Set();
+    precisionExcludedFaces = new Set();
     refreshExclusionOverlay();
   });
 
   exclModeExcludeBtn.addEventListener('click', () => setSelectionMode(false));
   exclModeIncludeBtn.addEventListener('click', () => setSelectionMode(true));
+
+  // ── Precision masking wiring ──────────────────────────────────────────────
+  precisionMaskingToggle.addEventListener('change', () => {
+    togglePrecisionMasking(precisionMaskingToggle.checked);
+  });
+  precisionRefreshBtn.addEventListener('click', () => {
+    refreshPrecisionMesh();
+  });
 
   // ── Canvas mouse events for exclusion painting ────────────────────────────
   canvas.addEventListener('mousedown', (e) => {
@@ -563,6 +598,9 @@ function wireEvents() {
 
     if (!exclusionTool) return;
 
+    // Block painting while precision mesh is being built
+    if (precisionBusy) return;
+
     if (exclusionTool === 'bucket') {
       e.preventDefault();
       _lastHoverTriIdx = -1;
@@ -570,8 +608,18 @@ function wireEvents() {
       const triIdx = pickTriangle(e);
       if (triIdx >= 0) {
         const filled = bucketFill(triIdx, triangleAdjacency, bucketThreshold);
+        // Bucket fill always uses original face indices
         for (const t of filled) {
           if (eraseMode) excludedFaces.delete(t); else excludedFaces.add(t);
+        }
+        // If precision is active, also sync to precisionExcludedFaces
+        if (precisionMaskingEnabled && precisionParentMap) {
+          const len = precisionParentMap.length;
+          for (let i = 0; i < len; i++) {
+            if (filled.has(precisionParentMap[i])) {
+              if (eraseMode) precisionExcludedFaces.delete(i); else precisionExcludedFaces.add(i);
+            }
+          }
         }
         refreshExclusionOverlay();
         _lastHoverTriIdx = -1;
@@ -647,6 +695,7 @@ function setSelectionMode(include) {
     : t('excl.hintExclude');
   // Clear the painted set — faces had opposite semantics in the previous mode
   excludedFaces = new Set();
+  precisionExcludedFaces = new Set();
   refreshExclusionOverlay();
 }
 
@@ -669,6 +718,8 @@ function setExclusionTool(tool) {
   exclBrushTypeRow.classList.toggle('hidden', exclusionTool !== 'brush');
   // Show radius row only while brush + radius mode is active
   exclRadiusRow.classList.toggle('hidden', !(exclusionTool === 'brush' && brushIsRadius));
+  // Show precision masking row only when brush + circle mode is active
+  precisionMaskingRow.classList.toggle('hidden', !(exclusionTool === 'brush' && brushIsRadius));
   // Show threshold row only while bucket is active
   exclThresholdRow.classList.toggle('hidden', exclusionTool !== 'bucket');
   canvas.style.cursor = (exclusionTool === 'brush' && brushIsRadius) ? 'none' : exclusionTool ? 'crosshair' : '';
@@ -722,6 +773,10 @@ function pickTriangle(e) {
   // original face index so that excludedFaces always stores original indices.
   if (dispPreviewGeometry && mesh.geometry === dispPreviewGeometry && dispPreviewParentMap) {
     fi = dispPreviewParentMap[fi];
+  }
+  // Same mapping for precision masking geometry
+  if (precisionGeometry && mesh.geometry === precisionGeometry && precisionParentMap) {
+    fi = precisionParentMap[fi];
   }
   return fi;
 }
@@ -779,15 +834,19 @@ function distSqPointToTri(px, py, pz, ax, ay, az, bx, by, bz, cx, cy, cz) {
 
 /** Test all triangles against a sphere and invoke cb(triIdx) for each hit. */
 function forEachTriInSphere(hitPt, r2, cb) {
-  const pos = currentGeometry.attributes.position;
-  const triCount = triangleCentroids.length / 3;
+  const usePrecision = precisionMaskingEnabled && precisionGeometry;
+  const geo = usePrecision ? precisionGeometry : currentGeometry;
+  const centroids = usePrecision ? precisionCentroids : triangleCentroids;
+  const boundRadii = usePrecision ? precisionBoundRadii : triangleBoundRadii;
+  const pos = geo.attributes.position;
+  const triCount = centroids.length / 3;
   const r = Math.sqrt(r2);
   for (let t = 0; t < triCount; t++) {
     // Quick reject: centroid distance > brush radius + triangle bounding radius
-    const dx = triangleCentroids[t*3]   - hitPt.x;
-    const dy = triangleCentroids[t*3+1] - hitPt.y;
-    const dz = triangleCentroids[t*3+2] - hitPt.z;
-    const bound = r + triangleBoundRadii[t];
+    const dx = centroids[t*3]   - hitPt.x;
+    const dy = centroids[t*3+1] - hitPt.y;
+    const dz = centroids[t*3+2] - hitPt.z;
+    const bound = r + boundRadii[t];
     if (dx*dx + dy*dy + dz*dz > bound*bound) continue;
     // Precise sphere-triangle test
     const i = t * 3;
@@ -809,19 +868,33 @@ function paintAt(e) {
   const hit = getFrontFaceHit(hits, mesh);
   if (!hit) return;
 
-  // Map subdivided → original face index when displacement preview is active
-  let triIdx = hit.faceIndex;
-  if (dispPreviewGeometry && mesh.geometry === dispPreviewGeometry && dispPreviewParentMap) {
-    triIdx = dispPreviewParentMap[triIdx];
-  }
+  const usePrecision = precisionMaskingEnabled && precisionGeometry && precisionParentMap;
 
-  if (brushIsRadius) {
-    const r2 = brushRadius * brushRadius;
-    forEachTriInSphere(hit.point, r2, t => {
-      if (eraseMode) excludedFaces.delete(t); else excludedFaces.add(t);
-    });
+  if (usePrecision) {
+    // Precision mode: store precision face indices for fine-grained selection
+    if (brushIsRadius) {
+      const r2 = brushRadius * brushRadius;
+      forEachTriInSphere(hit.point, r2, t => {
+        if (eraseMode) precisionExcludedFaces.delete(t); else precisionExcludedFaces.add(t);
+      });
+    } else {
+      const precIdx = hit.faceIndex; // precision face index (mesh is precision geometry)
+      if (eraseMode) precisionExcludedFaces.delete(precIdx); else precisionExcludedFaces.add(precIdx);
+    }
   } else {
-    if (eraseMode) excludedFaces.delete(triIdx); else excludedFaces.add(triIdx);
+    // Normal mode: store original face indices
+    let triIdx = hit.faceIndex;
+    if (dispPreviewGeometry && mesh.geometry === dispPreviewGeometry && dispPreviewParentMap) {
+      triIdx = dispPreviewParentMap[triIdx];
+    }
+    if (brushIsRadius) {
+      const r2 = brushRadius * brushRadius;
+      forEachTriInSphere(hit.point, r2, t => {
+        if (eraseMode) excludedFaces.delete(t); else excludedFaces.add(t);
+      });
+    } else {
+      if (eraseMode) excludedFaces.delete(triIdx); else excludedFaces.add(triIdx);
+    }
   }
 
   refreshExclusionOverlay();
@@ -836,6 +909,8 @@ function togglePlaceOnFace(active) {
   if (active) {
     // Deactivate exclusion tool
     if (exclusionTool) setExclusionTool(null);
+    // Deactivate precision masking (geometry will be rotated/replaced)
+    if (precisionMaskingEnabled) deactivatePrecisionMasking();
     canvas.style.cursor = 'crosshair';
   } else {
     if (!exclusionTool) canvas.style.cursor = '';
@@ -918,6 +993,16 @@ function handlePlaceOnFaceClick(e) {
   settings.useDisplacement = false;
   dispPreviewToggle.checked = false;
 
+  // Reset precision masking (geometry was rotated)
+  if (precisionGeometry) { precisionGeometry.dispose(); precisionGeometry = null; }
+  precisionParentMap = null; precisionEdgeLength = null;
+  precisionCentroids = null; precisionBoundRadii = null; precisionAdjacency = null;
+  precisionMaskingEnabled = false; precisionMaskingToggle.checked = false;
+  precisionStatus.textContent = '';
+  precisionOutdated.classList.add('hidden'); precisionRefreshBtn.classList.add('hidden');
+  precisionWarning.classList.add('hidden'); precisionMaskingRow.classList.add('hidden');
+  precisionExcludedFaces = new Set();
+
   // Deactivate tools but keep excludedFaces (face indices are stable after rotation)
   exclusionTool     = null;
   eraseMode         = false;
@@ -967,23 +1052,29 @@ function handlePlaceOnFaceClick(e) {
 
 function refreshExclusionOverlay() {
   if (!currentGeometry) return;
+
+  // Choose which geometry and face set to build the overlay from
+  const usePrecision = precisionMaskingEnabled && precisionGeometry;
+  const overlayGeo = usePrecision ? precisionGeometry : currentGeometry;
+  const overlayFaceSet = usePrecision ? precisionExcludedFaces : excludedFaces;
+
   if (selectionMode) {
-    // Include Only mode: tint the complement (non-selected faces) with a pastel blue
-    // so the model stays visible against the dark background before any faces are painted.
-    const maskGeo = buildExclusionOverlayGeo(currentGeometry, excludedFaces, true);
+    const maskGeo = buildExclusionOverlayGeo(overlayGeo, overlayFaceSet, true);
     setExclusionOverlay(maskGeo, 0x8ab4d4, 0.96);
   } else {
-    setExclusionOverlay(buildExclusionOverlayGeo(currentGeometry, excludedFaces), 0xff6600);
+    setExclusionOverlay(buildExclusionOverlayGeo(overlayGeo, overlayFaceSet), 0xff6600);
   }
-  const n = excludedFaces.size;
+  const n = usePrecision ? precisionExcludedFaces.size : excludedFaces.size;
   exclCount.textContent = selectionMode
     ? t(n === 1 ? 'excl.faceSelected' : 'excl.facesSelected', { n: n.toLocaleString() })
     : t(n === 1 ? 'excl.faceExcluded' : 'excl.facesExcluded', { n: n.toLocaleString() });
 
   // Update the faceMask attribute on the active preview geometry so the shader
   // reflects user-painted exclusions in real time.
-  const activeGeo = (settings.useDisplacement && dispPreviewGeometry)
-    ? dispPreviewGeometry : currentGeometry;
+  const activeGeo = usePrecision
+    ? precisionGeometry
+    : (settings.useDisplacement && dispPreviewGeometry)
+      ? dispPreviewGeometry : currentGeometry;
   updateFaceMask(activeGeo);
 }
 
@@ -1036,22 +1127,34 @@ function updateBrushHover(e) {
   const hit = getFrontFaceHit(hits, mesh);
   if (!hit) { _lastHoverTriIdx = -1; setHoverPreview(null); return; }
 
+  // Use raw face index for cache when precision is active (small faces → frequent updates)
+  const usePrecision = precisionMaskingEnabled && precisionGeometry && precisionParentMap;
   let triIdx = hit.faceIndex;
-  if (dispPreviewGeometry && mesh.geometry === dispPreviewGeometry && dispPreviewParentMap) {
-    triIdx = dispPreviewParentMap[triIdx];
+  if (!usePrecision) {
+    if (dispPreviewGeometry && mesh.geometry === dispPreviewGeometry && dispPreviewParentMap) {
+      triIdx = dispPreviewParentMap[triIdx];
+    }
   }
   if (triIdx === _lastHoverTriIdx) return;
   _lastHoverTriIdx = triIdx;
 
+  const hoverGeo = usePrecision ? precisionGeometry : currentGeometry;
   const hoverColor = eraseMode ? 0x999999 : 0xffee00;
   if (brushIsRadius) {
     const r2 = brushRadius * brushRadius;
     const hovered = new Set();
     forEachTriInSphere(hit.point, r2, t => hovered.add(t));
-    setHoverPreview(buildExclusionOverlayGeo(currentGeometry, hovered), hoverColor);
+    setHoverPreview(buildExclusionOverlayGeo(hoverGeo, hovered), hoverColor);
   } else {
-    const hovered = new Set([triIdx]);
-    setHoverPreview(buildExclusionOverlayGeo(currentGeometry, hovered), hoverColor);
+    // For single mode with precision, find the refined face index for the hover highlight
+    if (usePrecision) {
+      const rawIdx = hit.faceIndex;
+      const hovered = new Set([rawIdx]);
+      setHoverPreview(buildExclusionOverlayGeo(precisionGeometry, hovered), hoverColor);
+    } else {
+      const hovered = new Set([triIdx]);
+      setHoverPreview(buildExclusionOverlayGeo(currentGeometry, hovered), hoverColor);
+    }
   }
 }
 
@@ -1064,7 +1167,18 @@ function updateBucketHover(e) {
     return;
   }
   const hovered = bucketFill(triIdx, triangleAdjacency, bucketThreshold);
-  setHoverPreview(buildExclusionOverlayGeo(currentGeometry, hovered), eraseMode ? 0x999999 : 0xffee00);
+  const usePrecision = precisionMaskingEnabled && precisionGeometry && precisionParentMap;
+  if (usePrecision) {
+    // Map original face indices to precision face indices for overlay
+    const refinedHover = new Set();
+    const len = precisionParentMap.length;
+    for (let i = 0; i < len; i++) {
+      if (hovered.has(precisionParentMap[i])) refinedHover.add(i);
+    }
+    setHoverPreview(buildExclusionOverlayGeo(precisionGeometry, refinedHover), eraseMode ? 0x999999 : 0xffee00);
+  } else {
+    setHoverPreview(buildExclusionOverlayGeo(currentGeometry, hovered), eraseMode ? 0x999999 : 0xffee00);
+  }
 }
 
 // ── Slider helper ─────────────────────────────────────────────────────────────
@@ -1217,8 +1331,24 @@ async function handleModelFile(file) {
     settings.useDisplacement = false;
     dispPreviewToggle.checked = false;
 
+    // Reset precision masking for the new mesh
+    if (precisionGeometry) { precisionGeometry.dispose(); precisionGeometry = null; }
+    precisionParentMap  = null;
+    precisionEdgeLength = null;
+    precisionCentroids  = null;
+    precisionBoundRadii = null;
+    precisionAdjacency  = null;
+    precisionMaskingEnabled = false;
+    precisionMaskingToggle.checked = false;
+    precisionStatus.textContent = '';
+    precisionOutdated.classList.add('hidden');
+    precisionRefreshBtn.classList.add('hidden');
+    precisionWarning.classList.add('hidden');
+    precisionMaskingRow.classList.add('hidden');
+
     // Reset exclusion state for the new mesh
     excludedFaces     = new Set();
+    precisionExcludedFaces = new Set();
     exclusionTool     = null;
     eraseMode         = false;
     isPainting        = false;
@@ -1298,14 +1428,21 @@ function updateFaceMask(geometry) {
   const triCount = posCount / 3;
   const maskArr = new Float32Array(posCount);
 
+  // Determine which face set to check
+  const isPrecision = (geometry === precisionGeometry && precisionMaskingEnabled);
+  const faceSet = isPrecision ? precisionExcludedFaces : excludedFaces;
+
   // Fast path: no user exclusion active
-  if (excludedFaces.size === 0 && !selectionMode) {
+  if (faceSet.size === 0 && !selectionMode) {
     maskArr.fill(1.0);
   } else {
     const isDisp = (geometry === dispPreviewGeometry && dispPreviewParentMap);
     for (let t = 0; t < triCount; t++) {
-      const origFace = isDisp ? dispPreviewParentMap[t] : t;
-      const excluded = selectionMode ? !excludedFaces.has(origFace) : excludedFaces.has(origFace);
+      // For precision geometry, t is already a precision face index.
+      // For disp preview, map through dispPreviewParentMap to original.
+      // Otherwise t is already an original face index.
+      const faceIdx = isDisp ? dispPreviewParentMap[t] : t;
+      const excluded = selectionMode ? !faceSet.has(faceIdx) : faceSet.has(faceIdx);
       const val = excluded ? 0.0 : 1.0;
       maskArr[t * 3]     = val;
       maskArr[t * 3 + 1] = val;
@@ -1626,6 +1763,215 @@ function addSmoothNormals(geometry) {
   geometry.setAttribute('smoothNormal', new THREE.Float32BufferAttribute(sn, 3));
 }
 
+// ── Precision masking ─────────────────────────────────────────────────────────
+
+/** Compute the target max edge length from the brush diameter. */
+function computePrecisionEdgeLength(brushDiameter) {
+  // ~20 edge segments around the brush circumference, clamped to a sane floor
+  return Math.max(0.05, Math.PI * brushDiameter / 20);
+}
+
+/**
+ * Estimate how many triangles subdivision will produce for a given edge length.
+ * Uses a sample of existing edges to compute average edge length, then
+ * assumes area-proportional subdivision: triCount × (avgEdge / target)².
+ */
+function estimateSubdivisionTriCount(geometry, targetEdge) {
+  const pos = geometry.attributes.position;
+  const triCount = pos.count / 3;
+  // Sample up to 3000 edges (1000 triangles × 3 edges)
+  const sampleTris = Math.min(triCount, 1000);
+  let totalEdgeLen = 0;
+  let edgeCount = 0;
+  for (let t = 0; t < sampleTris; t++) {
+    const i = t * 3;
+    for (let e = 0; e < 3; e++) {
+      const a = i + e, b = i + (e + 1) % 3;
+      const dx = pos.getX(a) - pos.getX(b);
+      const dy = pos.getY(a) - pos.getY(b);
+      const dz = pos.getZ(a) - pos.getZ(b);
+      totalEdgeLen += Math.sqrt(dx * dx + dy * dy + dz * dz);
+      edgeCount++;
+    }
+  }
+  if (edgeCount === 0) return triCount;
+  const avgEdge = totalEdgeLen / edgeCount;
+  const ratio = avgEdge / targetEdge;
+  return Math.max(triCount, Math.round(triCount * ratio * ratio));
+}
+
+/** Deactivate precision masking and bake the refined mesh as the new base geometry. */
+function deactivatePrecisionMasking() {
+  if (precisionGeometry) {
+    // Bake: the precision geometry becomes the new currentGeometry
+    if (currentGeometry && currentGeometry !== precisionGeometry) {
+      currentGeometry.dispose();
+    }
+    currentGeometry = precisionGeometry;
+
+    // Promote precision adjacency data to the base adjacency
+    triangleAdjacency  = precisionAdjacency;
+    triangleCentroids  = precisionCentroids;
+    triangleBoundRadii = precisionBoundRadii;
+
+    // Promote precision excluded faces to the base set
+    excludedFaces = precisionExcludedFaces;
+
+    // Update mesh info display
+    const triCount = getTriangleCount(currentGeometry);
+    const mb = ((currentGeometry.attributes.position.array.byteLength) / 1024 / 1024).toFixed(2);
+    const sx = currentBounds.size.x.toFixed(2);
+    const sy = currentBounds.size.y.toFixed(2);
+    const sz = currentBounds.size.z.toFixed(2);
+    meshInfo.textContent = t('ui.meshInfo', { n: triCount.toLocaleString(), mb, sx, sy, sz });
+  } else if (precisionExcludedFaces.size > 0 && precisionParentMap) {
+    // No precision geometry but have selections — map back to original
+    excludedFaces = new Set();
+    for (const pf of precisionExcludedFaces) {
+      excludedFaces.add(precisionParentMap[pf]);
+    }
+  }
+
+  // Clear all precision state
+  precisionExcludedFaces = new Set();
+  precisionGeometry   = null;
+  precisionParentMap  = null;
+  precisionEdgeLength = null;
+  precisionCentroids  = null;
+  precisionBoundRadii = null;
+  precisionAdjacency  = null;
+  precisionMaskingEnabled = false;
+  precisionMaskingToggle.checked = false;
+  precisionStatus.textContent = '';
+  precisionOutdated.classList.add('hidden');
+  precisionRefreshBtn.classList.add('hidden');
+  precisionWarning.classList.add('hidden');
+  if (currentGeometry) {
+    setMeshGeometry(currentGeometry);
+    updateFaceMask(currentGeometry);
+    if (excludedFaces.size > 0) refreshExclusionOverlay();
+    else setExclusionOverlay(null);
+  }
+}
+
+/** Refresh (or initially build) the precision mesh from current brush size. */
+async function refreshPrecisionMesh() {
+  if (!currentGeometry || precisionBusy) return;
+
+  const brushDiameter = parseFloat(exclBrushRadiusSlider.value);
+  const targetEdge = computePrecisionEdgeLength(brushDiameter);
+
+  // Estimate triangle count and warn if > 5M
+  const estimated = estimateSubdivisionTriCount(currentGeometry, targetEdge);
+  if (estimated > 5_000_000) {
+    const estLabel = (estimated / 1_000_000).toFixed(1) + 'M';
+    const msg = t('precision.warningBody', { n: estLabel });
+    if (!confirm(msg)) return;
+  }
+
+  precisionBusy = true;
+  precisionStatus.textContent = t('precision.refining');
+  precisionOutdated.classList.add('hidden');
+  precisionRefreshBtn.classList.add('hidden');
+  precisionWarning.classList.add('hidden');
+
+  try {
+    await yieldFrame();
+
+    const { geometry: subdivided, safetyCapHit, faceParentId } = await subdivide(
+      currentGeometry, targetEdge, null, null, { fast: true }
+    );
+
+    // Dispose previous precision geometry if any
+    if (precisionGeometry) precisionGeometry.dispose();
+    precisionGeometry  = subdivided;
+    precisionParentMap = faceParentId;
+    precisionEdgeLength = targetEdge;
+
+    // Build adjacency data for the refined mesh
+    const adjData = buildAdjacency(precisionGeometry);
+    precisionAdjacency  = adjData.adjacency;
+    precisionCentroids  = adjData.centroids;
+    precisionBoundRadii = adjData.boundRadii;
+
+    // Seed precisionExcludedFaces from existing excludedFaces
+    precisionExcludedFaces = new Set();
+    if (excludedFaces.size > 0) {
+      const len = precisionParentMap.length;
+      for (let i = 0; i < len; i++) {
+        if (excludedFaces.has(precisionParentMap[i])) precisionExcludedFaces.add(i);
+      }
+    }
+
+    // Swap display mesh to refined geometry
+    setMeshGeometry(precisionGeometry);
+    updateFaceMask(precisionGeometry);
+    if (precisionExcludedFaces.size > 0) refreshExclusionOverlay();
+    else setExclusionOverlay(null);
+
+    // Update status label
+    const triCount = precisionGeometry.attributes.position.count / 3;
+    const triLabel = triCount >= 1_000_000
+      ? (triCount / 1_000_000).toFixed(1) + 'M'
+      : triCount >= 1_000
+        ? (triCount / 1_000).toFixed(0) + 'k'
+        : String(triCount);
+    precisionStatus.textContent = t('precision.triCount', { n: triLabel });
+
+    // Update mesh info in the lower-left corner
+    const mb = ((precisionGeometry.attributes.position.array.byteLength) / 1024 / 1024).toFixed(2);
+    const sx = currentBounds.size.x.toFixed(2);
+    const sy = currentBounds.size.y.toFixed(2);
+    const sz = currentBounds.size.z.toFixed(2);
+    meshInfo.textContent = t('ui.meshInfo', { n: triCount.toLocaleString(), mb, sx, sy, sz });
+
+    if (safetyCapHit) {
+      triLimitWarning.classList.remove('hidden');
+    }
+  } catch (err) {
+    console.error('Precision masking subdivision failed:', err);
+    deactivatePrecisionMasking();
+  } finally {
+    precisionBusy = false;
+  }
+}
+
+/** Toggle precision masking on/off. */
+async function togglePrecisionMasking(enable) {
+  if (enable) {
+    // Mutually exclusive with displacement preview
+    if (settings.useDisplacement) {
+      settings.useDisplacement = false;
+      dispPreviewToggle.checked = false;
+      await toggleDisplacementPreview(false);
+    }
+    precisionMaskingEnabled = true;
+    await refreshPrecisionMesh();
+    // If refresh was cancelled (e.g. user declined warning), revert
+    if (!precisionGeometry) {
+      precisionMaskingEnabled = false;
+      precisionMaskingToggle.checked = false;
+    }
+  } else {
+    deactivatePrecisionMasking();
+  }
+}
+
+/** Show/hide the "outdated" badge when brush size changes while precision is active. */
+function checkPrecisionOutdated() {
+  if (!precisionMaskingEnabled || !precisionEdgeLength) return;
+  const neededEdge = computePrecisionEdgeLength(parseFloat(exclBrushRadiusSlider.value));
+  // Show outdated if the needed edge is significantly smaller than current
+  // (brush shrank → mesh too coarse for the new brush size)
+  if (neededEdge < precisionEdgeLength * 0.8) {
+    precisionOutdated.classList.remove('hidden');
+    precisionRefreshBtn.classList.remove('hidden');
+  } else {
+    precisionOutdated.classList.add('hidden');
+    precisionRefreshBtn.classList.add('hidden');
+  }
+}
+
 /**
  * Toggle displacement preview on/off.
  * When enabled: subdivides the current geometry to a moderate resolution,
@@ -1639,6 +1985,11 @@ async function toggleDisplacementPreview(enable) {
   // Exit surface masking mode when the 3D preview is activated
   if (enable && exclusionTool) {
     setExclusionTool(null);
+  }
+
+  // Deactivate precision masking when displacement preview is activated
+  if (enable && precisionMaskingEnabled) {
+    deactivatePrecisionMasking();
   }
 
   if (!enable) {
@@ -1759,6 +2110,11 @@ async function handleExport() {
   isExporting = true;
   exportBtn.classList.add('busy');
   exportProgress.classList.remove('hidden');
+
+  // If precision masking is active, bake the refined mesh before exporting
+  if (precisionMaskingEnabled) {
+    deactivatePrecisionMasking();
+  }
 
   try {
     setProgress(0.02, t('progress.subdividing'));
