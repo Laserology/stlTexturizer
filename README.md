@@ -130,6 +130,26 @@ cd stlTexturizer
 
 Then start any static file server from the project root. Pick whichever you have installed:
 
+**Docker (same as below, containerized)**
+```bash
+podman run -e port=8000 -p 8000:8000 -d ghcr.io/CNCKitchen/stltexturizer:main"
+```
+
+**Docker Compose**
+```yml
+services:
+  Bump-Mesh:
+    image: "ghcr.io/CNCKitchen/stltexturizer:main"
+    container_name: "BumpMesh"
+    environment:
+      - "port=8000"
+    restart: "always"
+    ports:
+      - "8000:8000/tcp"
+    security_opt:
+      - "no-new-privileges:true"
+```
+
 **Python (3.x)**
 ```bash
 python -m http.server 8000
