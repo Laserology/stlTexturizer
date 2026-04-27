@@ -9,7 +9,7 @@ EXPOSE $port/tcp
 
 # Perform updates & install dependancies.
 RUN apt update
-RUN apt install git python3 python3-requests -y
+RUN apt install python3 python3-requests -y
 
 # Copy in BumpMesh
 COPY . /app
