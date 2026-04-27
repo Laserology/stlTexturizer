@@ -181,5 +181,17 @@ export default {
   "header.exportModelLabel": "Model (STL)",
   "header.exportTextureLabel": "Custom texture",
   "header.exportGo": "Save",
-  "alerts.importFailed": "Could not load project: {msg}"
+  "alerts.importFailed": "Could not load project: {msg}",
+  "labels.snapSeamless": "Snap to seamless wrap ⓘ",
+  "tooltips.snapSeamless": "Snaps the U scale to integer wrap counts so the texture seamlessly wraps around the cylinder.",
+  "labels.cylinderAxis": "Cylinder Axis",
+  "ui.cylinderAutofit": "Auto-fit",
+  "tooltips.cylinderAutofit": "Fit a circle to the part's outward-facing vertices (least-squares).",
+  "ui.cylinderReset": "Reset",
+  "tooltips.cylinderReset": "Reset axis to bounding-box center and bounding-box-derived radius.",
+  "ui.cylinderPanelAria": "Cylinder axis placement",
+  "ui.cylinderPanelLabel": "Define cylinder projection",
+  "ui.cylinderNoModel1": "Load a model to position",
+  "ui.cylinderNoModel2": "the cylinder axis",
+  "ui.cylinderPanelMinimize": "Minimize / restore"
 };

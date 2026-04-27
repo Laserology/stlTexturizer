@@ -181,5 +181,17 @@ export default {
   "header.exportModelLabel": "모델 (STL)",
   "header.exportTextureLabel": "사용자 텍스처",
   "header.exportGo": "저장",
-  "alerts.importFailed": "프로젝트를 불러올 수 없습니다: {msg}"
+  "alerts.importFailed": "프로젝트를 불러올 수 없습니다: {msg}",
+  "labels.snapSeamless": "이음새 없이 감싸기 스냅 ⓘ",
+  "tooltips.snapSeamless": "U 스케일을 정수 반복 횟수로 스냅하여 텍스처가 원통에 이음새 없이 감기도록 합니다.",
+  "labels.cylinderAxis": "원통 축",
+  "ui.cylinderAutofit": "자동 맞춤",
+  "tooltips.cylinderAutofit": "바깥쪽을 향한 정점들에 원을 최소제곱법으로 맞춥니다.",
+  "ui.cylinderReset": "재설정",
+  "tooltips.cylinderReset": "축을 바운딩 박스 중심과 거기서 도출된 반지름으로 재설정합니다.",
+  "ui.cylinderPanelAria": "원통 축 배치",
+  "ui.cylinderPanelLabel": "원통 투영 정의",
+  "ui.cylinderNoModel1": "모델을 불러와",
+  "ui.cylinderNoModel2": "원통 축을 배치하세요",
+  "ui.cylinderPanelMinimize": "최소화 / 복원"
 };

@@ -181,5 +181,17 @@ export default {
   "header.exportModelLabel": "Modell (STL)",
   "header.exportTextureLabel": "Eigene Textur",
   "header.exportGo": "Speichern",
-  "alerts.importFailed": "Projekt konnte nicht geladen werden: {msg}"
+  "alerts.importFailed": "Projekt konnte nicht geladen werden: {msg}",
+  "labels.snapSeamless": "Nahtlos umlaufend einrasten ⓘ",
+  "tooltips.snapSeamless": "Rastet die U-Skalierung auf ganzzahlige Wiederholungen ein, damit die Textur nahtlos um den Zylinder verläuft.",
+  "labels.cylinderAxis": "Zylinderachse",
+  "ui.cylinderAutofit": "Auto-Fit",
+  "tooltips.cylinderAutofit": "Kreis an die nach außen zeigenden Punkte des Teils anpassen (Methode der kleinsten Quadrate).",
+  "ui.cylinderReset": "Zurücksetzen",
+  "tooltips.cylinderReset": "Achse auf den Mittelpunkt der Bounding Box und den daraus abgeleiteten Radius zurücksetzen.",
+  "ui.cylinderPanelAria": "Zylinderachsen-Platzierung",
+  "ui.cylinderPanelLabel": "Zylinderprojektion festlegen",
+  "ui.cylinderNoModel1": "Modell laden, um die",
+  "ui.cylinderNoModel2": "Zylinderachse zu setzen",
+  "ui.cylinderPanelMinimize": "Minimieren / Wiederherstellen"
 };

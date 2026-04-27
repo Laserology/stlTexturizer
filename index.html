@@ -102,6 +102,22 @@
           </div>
           <div id="mesh-diag-advanced" class="mesh-diag-results hidden"></div>
         </div>
+        <div id="cylinder-panel" class="cylinder-panel hidden"
+          data-i18n-aria-label="ui.cylinderPanelAria"
+          aria-label="Cylinder axis placement">
+          <canvas id="cylinder-canvas" width="240" height="240"></canvas>
+          <div class="cylinder-panel-label">
+            <span data-i18n="ui.cylinderPanelLabel">Define cylinder projection</span>
+            <button id="cylinder-panel-minimize" class="cylinder-panel-minimize"
+              type="button"
+              data-i18n-title="ui.cylinderPanelMinimize"
+              data-i18n-aria-label="ui.cylinderPanelMinimize"
+              title="Minimize" aria-label="Minimize">
+              <svg class="icon-minimize" width="10" height="10" viewBox="0 0 24 24" fill="none"><path d="M5 12h14" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"/></svg>
+              <svg class="icon-expand" width="10" height="10" viewBox="0 0 24 24" fill="none"><path d="M12 5v14M5 12h14" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"/></svg>
+            </button>
+          </div>
+        </div>
         <div id="store-cta-wrapper">
           <span id="store-cta">
             <span data-i18n-html="cta.store">Support this tool? Shop at <a href="https://geni.us/CNCStoreTexture" target="_blank" rel="noopener noreferrer">CNCKitchen.STORE</a> or send a tip via <a href="https://www.paypal.me/CNCKitchen" target="_blank" rel="noopener noreferrer">PayPal</a> / <a href="https://ko-fi.com/cnckitchen" target="_blank" rel="noopener noreferrer">Ko-fi</a></span><button id="store-cta-dismiss" aria-label="Dismiss">&times;</button>
@@ -221,6 +237,27 @@
           <label for="cap-angle" data-i18n="labels.capAngle" data-i18n-title="tooltips.capAngle" title="Angle (in degrees) from vertical at which the top/bottom cap projection kicks in. Smaller values limit cap projection to nearly flat faces.">Cap Angle ⓘ</label>
           <input type="range" id="cap-angle" min="1" max="89" step="1" value="20" />
           <input type="number" class="val" id="cap-angle-val" value="20" min="1" max="89" step="1" />
+        </div>
+        <div class="form-row" id="cylinder-snap-row" style="display:none">
+          <label class="checkbox-label" for="cylinder-snap-toggle"
+            data-i18n-title="tooltips.snapSeamless"
+            title="Snap U scale to integer wrap counts so the texture seamlessly wraps around the cylinder.">
+            <input type="checkbox" id="cylinder-snap-toggle" checked />
+            <span data-i18n="labels.snapSeamless">Snap to seamless wrap ⓘ</span>
+          </label>
+        </div>
+        <div class="form-row" id="cylinder-axis-row" style="display:none">
+          <label data-i18n="labels.cylinderAxis">Cylinder Axis</label>
+          <div class="cylinder-axis-controls">
+            <button id="cylinder-autofit-btn" type="button" class="cylinder-axis-btn"
+              data-i18n="ui.cylinderAutofit"
+              data-i18n-title="tooltips.cylinderAutofit"
+              title="Fit a circle to the part's outward-facing vertices (least-squares).">Auto-fit</button>
+            <button id="cylinder-reset-btn" type="button" class="cylinder-axis-btn"
+              data-i18n="ui.cylinderReset"
+              data-i18n-title="tooltips.cylinderReset"
+              title="Reset to AABB center and AABB-derived radius.">Reset</button>
+          </div>
         </div>
       </section>
 

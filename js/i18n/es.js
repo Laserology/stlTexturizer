@@ -181,5 +181,17 @@ export default {
   "header.exportModelLabel": "Modelo (STL)",
   "header.exportTextureLabel": "Textura personalizada",
   "header.exportGo": "Guardar",
-  "alerts.importFailed": "No se pudo cargar el proyecto: {msg}"
+  "alerts.importFailed": "No se pudo cargar el proyecto: {msg}",
+  "labels.snapSeamless": "Ajustar a envoltura sin costuras ⓘ",
+  "tooltips.snapSeamless": "Ajusta la escala U a un número entero de repeticiones para que la textura envuelva el cilindro sin costuras.",
+  "labels.cylinderAxis": "Eje del cilindro",
+  "ui.cylinderAutofit": "Auto-ajuste",
+  "tooltips.cylinderAutofit": "Ajusta un círculo a los vértices exteriores de la pieza (mínimos cuadrados).",
+  "ui.cylinderReset": "Restablecer",
+  "tooltips.cylinderReset": "Restablece el eje al centro de la caja delimitadora y al radio derivado de ella.",
+  "ui.cylinderPanelAria": "Posicionamiento del eje del cilindro",
+  "ui.cylinderPanelLabel": "Definir proyección cilíndrica",
+  "ui.cylinderNoModel1": "Carga un modelo para",
+  "ui.cylinderNoModel2": "colocar el eje del cilindro",
+  "ui.cylinderPanelMinimize": "Minimizar / restaurar"
 };

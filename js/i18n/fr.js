@@ -181,5 +181,17 @@ export default {
   "header.exportModelLabel": "Modèle (STL)",
   "header.exportTextureLabel": "Texture personnalisée",
   "header.exportGo": "Enregistrer",
-  "alerts.importFailed": "Impossible de charger le projet : {msg}"
+  "alerts.importFailed": "Impossible de charger le projet : {msg}",
+  "labels.snapSeamless": "Aligner sur enroulement sans couture ⓘ",
+  "tooltips.snapSeamless": "Aligne l'échelle U sur un nombre entier de répétitions afin que la texture s'enroule sans couture autour du cylindre.",
+  "labels.cylinderAxis": "Axe du cylindre",
+  "ui.cylinderAutofit": "Ajustement auto",
+  "tooltips.cylinderAutofit": "Ajuste un cercle aux sommets orientés vers l'extérieur de la pièce (moindres carrés).",
+  "ui.cylinderReset": "Réinitialiser",
+  "tooltips.cylinderReset": "Réinitialise l'axe au centre de la boîte englobante et au rayon dérivé de celle-ci.",
+  "ui.cylinderPanelAria": "Placement de l'axe du cylindre",
+  "ui.cylinderPanelLabel": "Définir la projection cylindrique",
+  "ui.cylinderNoModel1": "Chargez un modèle pour",
+  "ui.cylinderNoModel2": "positionner l'axe du cylindre",
+  "ui.cylinderPanelMinimize": "Réduire / restaurer"
 };

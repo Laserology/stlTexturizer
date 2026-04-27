@@ -181,5 +181,17 @@ export default {
   "header.exportModelLabel": "Modello (STL)",
   "header.exportTextureLabel": "Texture personalizzata",
   "header.exportGo": "Salva",
-  "alerts.importFailed": "Impossibile caricare il progetto: {msg}"
+  "alerts.importFailed": "Impossibile caricare il progetto: {msg}",
+  "labels.snapSeamless": "Aggancia ad avvolgimento senza giunture ⓘ",
+  "tooltips.snapSeamless": "Aggancia la scala U a un numero intero di ripetizioni in modo che la texture avvolga il cilindro senza giunture.",
+  "labels.cylinderAxis": "Asse del cilindro",
+  "ui.cylinderAutofit": "Auto-fit",
+  "tooltips.cylinderAutofit": "Adatta un cerchio ai vertici rivolti verso l'esterno (minimi quadrati).",
+  "ui.cylinderReset": "Reimposta",
+  "tooltips.cylinderReset": "Ripristina l'asse al centro del bounding box e al raggio derivato.",
+  "ui.cylinderPanelAria": "Posizionamento dell'asse del cilindro",
+  "ui.cylinderPanelLabel": "Definisci proiezione cilindrica",
+  "ui.cylinderNoModel1": "Carica un modello per",
+  "ui.cylinderNoModel2": "posizionare l'asse del cilindro",
+  "ui.cylinderPanelMinimize": "Riduci / ripristina"
 };

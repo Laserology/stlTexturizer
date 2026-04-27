@@ -42,7 +42,11 @@
       "Bash(curl -sL https://raw.githubusercontent.com/prusa3d/PrusaSlicer/master/src/libslic3r/TriangleSelector.hpp -o /c/temp/ps/TS.hpp)",
       "Bash(curl -sL https://raw.githubusercontent.com/prusa3d/PrusaSlicer/master/src/libslic3r/TriangleSelector.cpp -o /c/temp/ps/TS.cpp)",
       "Read(//c/temp/ps/**)",
-      "Bash(node --check js/main.js)"
+      "Bash(node --check js/main.js)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(node test-cylindrical.mjs)",
+      "Bash(node --check js/mapping.js)",
+      "Bash(node --check js/previewMaterial.js)"
     ]
   }
 }

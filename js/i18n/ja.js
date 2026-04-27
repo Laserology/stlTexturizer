@@ -181,5 +181,17 @@ export default {
   "header.exportModelLabel": "モデル (STL)",
   "header.exportTextureLabel": "カスタムテクスチャ",
   "header.exportGo": "保存",
-  "alerts.importFailed": "プロジェクトを読み込めませんでした: {msg}"
+  "alerts.importFailed": "プロジェクトを読み込めませんでした: {msg}",
+  "labels.snapSeamless": "シームレスに巻き付けて固定 ⓘ",
+  "tooltips.snapSeamless": "Uスケールを整数回の繰り返しにスナップし、テクスチャが円柱に継ぎ目なく巻き付くようにします。",
+  "labels.cylinderAxis": "シリンダー軸",
+  "ui.cylinderAutofit": "自動フィット",
+  "tooltips.cylinderAutofit": "外向きの頂点に円を最小二乗法でフィットさせます。",
+  "ui.cylinderReset": "リセット",
+  "tooltips.cylinderReset": "軸をバウンディングボックスの中心と半径に戻します。",
+  "ui.cylinderPanelAria": "シリンダー軸の配置",
+  "ui.cylinderPanelLabel": "シリンダー投影を設定",
+  "ui.cylinderNoModel1": "モデルを読み込んで",
+  "ui.cylinderNoModel2": "シリンダー軸を配置してください",
+  "ui.cylinderPanelMinimize": "最小化 / 復元"
 };

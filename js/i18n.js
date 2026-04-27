@@ -5,10 +5,10 @@ export const TRANSLATIONS = {
   en: { 'lang.name': 'English' },
   de: { 'lang.name': 'Deutsch' },
   it: { 'lang.name': 'Italiano' },
-  es: { 'lang.name': 'Español (beta)' },
-  pt: { 'lang.name': 'Português (beta)' },
+  es: { 'lang.name': 'Español' },
+  pt: { 'lang.name': 'Português' },
   fr: { 'lang.name': 'Français' },
-  ja: { 'lang.name': '日本語 (beta)' },
+  ja: { 'lang.name': '日本語' },
   ko: { 'lang.name': '한국어' },
 };
 

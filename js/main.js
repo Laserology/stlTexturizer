@@ -82,6 +82,13 @@ const settings = {
   boundaryFalloff:  0,
   symmetricDisplacement: false,
   useDisplacement: false,
+  // Cylindrical-mode controls.
+  // null/undefined → derive from bounds (preserves legacy / non-cylindrical behavior).
+  snapSeamlessWrap: true,
+  cylinderCenterX:  null,
+  cylinderCenterY:  null,
+  cylinderRadius:   null,
+  cylinderPanelMinimized: false,
 };
 
 // ── Canvas filter support (Safari / iOS WebView don't support ctx.filter) ────
@@ -251,6 +258,14 @@ const textureSmoothingVal    = document.getElementById('texture-smoothing-val');
 const capAngleSlider         = document.getElementById('cap-angle');
 const capAngleVal            = document.getElementById('cap-angle-val');
 const capAngleRow            = document.getElementById('cap-angle-row');
+const cylinderSnapRow        = document.getElementById('cylinder-snap-row');
+const cylinderSnapToggle     = document.getElementById('cylinder-snap-toggle');
+const cylinderAxisRow        = document.getElementById('cylinder-axis-row');
+const cylinderAutofitBtn     = document.getElementById('cylinder-autofit-btn');
+const cylinderResetBtn       = document.getElementById('cylinder-reset-btn');
+const cylinderPanel          = document.getElementById('cylinder-panel');
+const cylinderCanvas         = document.getElementById('cylinder-canvas');
+const cylinderPanelMinimize  = document.getElementById('cylinder-panel-minimize');
 const boundaryFalloffSlider    = document.getElementById('boundary-falloff');
 const boundaryFalloffVal       = document.getElementById('boundary-falloff-val');
 const symmetricDispToggle    = document.getElementById('symmetric-displacement');
@@ -321,13 +336,494 @@ const _LOG_MAX = Math.log(10);
 const scaleToPos = v => Math.round(Math.max(0, Math.min(1000, (Math.log(Math.max(0.01, Math.min(10, v))) - _LOG_MIN) / (_LOG_MAX - _LOG_MIN) * 1000)));
 const posToScale = p => parseFloat(Math.exp(_LOG_MIN + (p / 1000) * (_LOG_MAX - _LOG_MIN)).toFixed(2));
 
+// Compute the active U texture-aspect factor (mirrors updatePreview's logic so
+// the snap math agrees with what computeUV actually does).
+function _currentTextureAspectU() {
+  const tw = activeMapEntry?.width ?? 1, th = activeMapEntry?.height ?? 1;
+  const tmax = Math.max(tw, th, 1);
+  return tmax / Math.max(tw, 1);
+}
+
+// Round a U scale to the nearest seamless-wrap value:
+//   tiles around circumference = aspectU / scaleU  →  must be a positive integer.
+// Returns the snapped scale, clamped to [aspectU/MAX_TILES, aspectU].
+function _snapScaleUForSeamlessWrap(scaleU) {
+  const aU = _currentTextureAspectU();
+  const MAX_TILES = 20;
+  let n = Math.round(aU / Math.max(scaleU, 1e-6));
+  if (!Number.isFinite(n) || n < 1) n = 1;
+  if (n > MAX_TILES) n = MAX_TILES;
+  return parseFloat((aU / n).toFixed(4));
+}
+
 function _applyScaleU(v) {
   v = Math.max(0.01, Math.min(10, v));
+  if (settings.snapSeamlessWrap && settings.mappingMode === 3 /* MODE_CYLINDRICAL */) {
+    v = _snapScaleUForSeamlessWrap(v);
+  }
   settings.scaleU = v;
   scaleUSlider.value = scaleToPos(v);
   scaleUVal.value = v;
   if (settings.lockScale) { settings.scaleV = v; scaleVSlider.value = scaleToPos(v); scaleVVal.value = v; }
   clearTimeout(previewDebounce); previewDebounce = setTimeout(updatePreview, 80);
+}
+
+// ── Cylindrical projection: inset panel + axis helpers ────────────────────────
+// The inset 2D panel shows a top-down (X-Y) silhouette of the part with two
+// draggable handles: a center dot and a radius ring. Both drive
+// settings.cylinderCenterX/Y and settings.cylinderRadius respectively. When any
+// of those settings is null/undefined, the rendering and the projection both
+// fall back to AABB-derived defaults — which preserves the pre-feature behavior
+// for old projects and non-cylindrical modes.
+
+let _cylSilhouetteCanvas     = null; // off-screen canvas of the X-Y silhouette
+let _cylSilhouetteGeometry   = null; // identity check so we re-rasterize on swap
+let _cylSilhouetteAnchor     = null; // { cxw, cyw, scale } — world XY at silhouette pixel-center, frozen at build time
+let _cylPanelTransform       = null; // { scale, cxw, cyw, W, H } — current view; cxw/cyw are mutated by panning
+let _cylDragMode             = null; // null | 'center' | 'radius' | 'pan'
+let _cylHoverMode            = null; // null | 'center' | 'radius' (for cursor + redraw)
+let _cylPanLastPx            = 0;    // last pointer X during pan, in panel pixels
+let _cylPanLastPy            = 0;    // last pointer Y during pan, in panel pixels
+let _cylRedrawScheduled      = false;
+let _cylPreviewThrottle      = null;
+
+// Hit-detection radii in panel pixels — kept in one place so pointer handlers
+// and the redraw both treat the same area as the handle.
+const _CYL_CENTER_HIT_PX = 10;
+const _CYL_RING_HIT_PX   = 8;
+
+function getEffectiveCylinderCenter() {
+  const cx = settings.cylinderCenterX ?? (currentBounds?.center.x ?? 0);
+  const cy = settings.cylinderCenterY ?? (currentBounds?.center.y ?? 0);
+  return { cx, cy };
+}
+
+function getEffectiveCylinderRadius() {
+  if (settings.cylinderRadius != null) return settings.cylinderRadius;
+  if (!currentBounds) return 1;
+  return Math.max(currentBounds.size.x, currentBounds.size.y) * 0.5;
+}
+
+function _buildCylinderSilhouette() {
+  if (!currentGeometry || !currentBounds) {
+    _cylSilhouetteCanvas = null;
+    _cylSilhouetteGeometry = null;
+    _cylSilhouetteAnchor = null;
+    _cylPanelTransform = null;
+    return;
+  }
+  if (_cylSilhouetteGeometry === currentGeometry && _cylSilhouetteCanvas) return;
+
+  const W = cylinderCanvas.width, H = cylinderCanvas.height;
+  const padPx = 18;
+  const sx = currentBounds.size.x, sy = currentBounds.size.y;
+  // Fit the silhouette into the panel with 50% room around the AABB so a
+  // slightly off-center axis is still visible without panning. Panning lets
+  // the user reach further when needed.
+  const halfX = Math.max(sx, 1e-6) * 0.75;
+  const halfY = Math.max(sy, 1e-6) * 0.75;
+  const cxw = (currentBounds.min.x + currentBounds.max.x) * 0.5;
+  const cyw = (currentBounds.min.y + currentBounds.max.y) * 0.5;
+  const drawW = W - padPx * 2;
+  const drawH = H - padPx * 2;
+  const scale = Math.min(drawW / (halfX * 2), drawH / (halfY * 2));
+  // The silhouette anchor is frozen at build time; the *view* transform
+  // (_cylPanelTransform) starts equal to the anchor and is mutated by panning.
+  _cylSilhouetteAnchor = { cxw, cyw, scale };
+  _cylPanelTransform   = { scale, cxw, cyw, W, H };
+
+  // Rasterize each triangle's X-Y projection into an offscreen canvas so we
+  // can later drawImage it at a panning offset (putImageData ignores transforms).
+  const pos = currentGeometry.attributes.position.array;
+  const idx = currentGeometry.index ? currentGeometry.index.array : null;
+  const triCount = idx ? (idx.length / 3) : (pos.length / 9);
+  const buf = new Uint8Array(W * H);
+  const wx2px = (wx) => (wx - cxw) * scale + W / 2;
+  const wy2py = (wy) => H / 2 - (wy - cyw) * scale;
+
+  for (let t = 0; t < triCount; t++) {
+    const i0 = idx ? idx[t * 3]     : t * 3;
+    const i1 = idx ? idx[t * 3 + 1] : t * 3 + 1;
+    const i2 = idx ? idx[t * 3 + 2] : t * 3 + 2;
+    const x0 = wx2px(pos[i0 * 3]),     y0 = wy2py(pos[i0 * 3 + 1]);
+    const x1 = wx2px(pos[i1 * 3]),     y1 = wy2py(pos[i1 * 3 + 1]);
+    const x2 = wx2px(pos[i2 * 3]),     y2 = wy2py(pos[i2 * 3 + 1]);
+    const minX = Math.max(0,     Math.floor(Math.min(x0, x1, x2)));
+    const maxX = Math.min(W - 1, Math.ceil(Math.max(x0, x1, x2)));
+    const minY = Math.max(0,     Math.floor(Math.min(y0, y1, y2)));
+    const maxY = Math.min(H - 1, Math.ceil(Math.max(y0, y1, y2)));
+    if (minX > maxX || minY > maxY) continue;
+    for (let py = minY; py <= maxY; py++) {
+      for (let px = minX; px <= maxX; px++) {
+        const fx = px + 0.5, fy = py + 0.5;
+        const w0 = (fx - x1) * (y2 - y1) - (fy - y1) * (x2 - x1);
+        const w1 = (fx - x2) * (y0 - y2) - (fy - y2) * (x0 - x2);
+        const w2 = (fx - x0) * (y1 - y0) - (fy - y0) * (x1 - x0);
+        if ((w0 >= 0 && w1 >= 0 && w2 >= 0) || (w0 <= 0 && w1 <= 0 && w2 <= 0)) {
+          buf[py * W + px] = 1;
+        }
+      }
+    }
+  }
+
+  const off = document.createElement('canvas');
+  off.width = W; off.height = H;
+  const offCtx = off.getContext('2d');
+  const img = offCtx.createImageData(W, H);
+  const d = img.data;
+  for (let i = 0; i < W * H; i++) {
+    if (buf[i]) {
+      d[i * 4]     = 110;
+      d[i * 4 + 1] = 130;
+      d[i * 4 + 2] = 145;
+      d[i * 4 + 3] = 220;
+    } else {
+      d[i * 4 + 3] = 0;
+    }
+  }
+  offCtx.putImageData(img, 0, 0);
+  _cylSilhouetteCanvas = off;
+  _cylSilhouetteGeometry = currentGeometry;
+}
+
+function _redrawCylinderPanel() {
+  if (!cylinderCanvas) return;
+  if (cylinderPanel.classList.contains('hidden')) return;
+  const ctx = cylinderCanvas.getContext('2d');
+  const W = cylinderCanvas.width, H = cylinderCanvas.height;
+  // Background — a cooler dark to read against the surface tone.
+  ctx.fillStyle = '#0e1418';
+  ctx.fillRect(0, 0, W, H);
+
+  if (_cylPanelTransform && _cylSilhouetteCanvas && _cylSilhouetteAnchor) {
+    // Translate the silhouette by the difference between its build-time anchor
+    // and the current view center, so panning shifts it visually without a
+    // re-rasterization.
+    const a = _cylSilhouetteAnchor, t0 = _cylPanelTransform;
+    const dxPx =  (a.cxw - t0.cxw) * t0.scale;
+    const dyPx = -(a.cyw - t0.cyw) * t0.scale;
+    ctx.drawImage(_cylSilhouetteCanvas, dxPx, dyPx);
+  }
+  if (!_cylPanelTransform) {
+    // No model loaded yet — show a hint instead of an empty black square.
+    ctx.fillStyle = 'rgba(180, 200, 220, 0.55)';
+    ctx.font = '11px system-ui, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(t('ui.cylinderNoModel1'), W / 2, H / 2 - 6);
+    ctx.fillText(t('ui.cylinderNoModel2'), W / 2, H / 2 + 8);
+    return;
+  }
+
+  const t = _cylPanelTransform;
+  const { cx, cy } = getEffectiveCylinderCenter();
+  const r = getEffectiveCylinderRadius();
+  const px = (cx - t.cxw) * t.scale + W / 2;
+  const py = H / 2 - (cy - t.cyw) * t.scale;
+  const pr = Math.max(2, r * t.scale);
+
+  const activeHandle = _cylDragMode || _cylHoverMode;
+  const ringActive   = activeHandle === 'radius';
+  const centerActive = activeHandle === 'center';
+
+  // Radius ring — thicker + brighter while hovered/dragged so it reads as a
+  // grabbable handle. A faint dashed inner halo on hover hints at "draggable".
+  ctx.lineWidth = ringActive ? 3.5 : 2;
+  ctx.strokeStyle = ringActive ? '#7be0e0' : '#22a3a3';
+  ctx.beginPath();
+  ctx.arc(px, py, pr, 0, Math.PI * 2);
+  ctx.stroke();
+
+  if (ringActive) {
+    ctx.save();
+    ctx.setLineDash([4, 4]);
+    ctx.lineWidth = 1;
+    ctx.strokeStyle = 'rgba(123, 224, 224, 0.6)';
+    ctx.beginPath(); ctx.arc(px, py, pr - 5, 0, Math.PI * 2); ctx.stroke();
+    ctx.beginPath(); ctx.arc(px, py, pr + 5, 0, Math.PI * 2); ctx.stroke();
+    ctx.restore();
+  }
+
+  // Center dot — grows a bit on hover/drag to mirror the ring's affordance.
+  const dotR = centerActive ? 8 : 6;
+  ctx.fillStyle = centerActive ? '#7be0e0' : '#22a3a3';
+  ctx.beginPath();
+  ctx.arc(px, py, dotR, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.strokeStyle = '#fff';
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+
+  // Axis crosshair to make the placement obvious.
+  ctx.strokeStyle = 'rgba(255,255,255,0.55)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(px - 12, py); ctx.lineTo(px - 8,  py);
+  ctx.moveTo(px + 8,  py); ctx.lineTo(px + 12, py);
+  ctx.moveTo(px, py - 12); ctx.lineTo(px, py - 8);
+  ctx.moveTo(px, py + 8);  ctx.lineTo(px, py + 12);
+  ctx.stroke();
+}
+
+// Returns 'center' | 'radius' | null for a panel-pixel coordinate.
+function _cylHandleAt(px, py) {
+  if (!_cylPanelTransform) return null;
+  const t = _cylPanelTransform;
+  const { cx, cy } = getEffectiveCylinderCenter();
+  const r = getEffectiveCylinderRadius();
+  const cpx = (cx - t.cxw) * t.scale + cylinderCanvas.width / 2;
+  const cpy = cylinderCanvas.height / 2 - (cy - t.cyw) * t.scale;
+  const dx = px - cpx, dy = py - cpy;
+  const distFromCenter = Math.sqrt(dx * dx + dy * dy);
+  const ringPx = r * t.scale;
+  if (distFromCenter <= _CYL_CENTER_HIT_PX) return 'center';
+  if (Math.abs(distFromCenter - ringPx) <= _CYL_RING_HIT_PX) return 'radius';
+  return null;
+}
+
+function _scheduleCylinderPanelRedraw() {
+  if (_cylRedrawScheduled) return;
+  _cylRedrawScheduled = true;
+  requestAnimationFrame(() => {
+    _cylRedrawScheduled = false;
+    _redrawCylinderPanel();
+  });
+}
+
+function _cylinderPanelToWorld(e) {
+  if (!_cylPanelTransform) return null;
+  const rect = cylinderCanvas.getBoundingClientRect();
+  const px = ((e.clientX - rect.left) / rect.width)  * cylinderCanvas.width;
+  const py = ((e.clientY - rect.top)  / rect.height) * cylinderCanvas.height;
+  const t = _cylPanelTransform;
+  const wx = (px - cylinderCanvas.width  / 2) / t.scale + t.cxw;
+  const wy = (cylinderCanvas.height / 2 - py) / t.scale + t.cyw;
+  return { px, py, wx, wy };
+}
+
+function _cylinderUpdateCursor() {
+  if (!cylinderCanvas) return;
+  const mode = _cylDragMode || _cylHoverMode;
+  if (mode === 'center')      cylinderCanvas.style.cursor = 'move';
+  else if (mode === 'radius') cylinderCanvas.style.cursor = 'ew-resize';
+  else if (_cylDragMode === 'pan') cylinderCanvas.style.cursor = 'grabbing';
+  else                        cylinderCanvas.style.cursor = 'grab';
+}
+
+function _cylinderPointerDown(e) {
+  if (!currentBounds) return;
+  const m = _cylinderPanelToWorld(e);
+  if (!m) return;
+  // Right-click and middle-click always pan (matching 3D-app conventions),
+  // even if they happen on a handle. Left-click prefers handle pick — center
+  // has higher priority than the ring when the ring is small enough that
+  // they overlap; the user can always grow the ring to pick it specifically.
+  const isPanButton = e.button === 1 || e.button === 2;
+  const handle = isPanButton ? null : _cylHandleAt(m.px, m.py);
+  if (handle) {
+    _cylDragMode = handle;
+  } else {
+    // Empty area (or pan-button) — pan the view so the user can place the
+    // cylinder axis outside the silhouette's default window (e.g. for a small
+    // fragment of a much larger cylinder).
+    _cylDragMode = 'pan';
+    _cylPanLastPx = m.px;
+    _cylPanLastPy = m.py;
+  }
+  _cylinderUpdateCursor();
+  _scheduleCylinderPanelRedraw();
+  try { cylinderCanvas.setPointerCapture(e.pointerId); } catch { /* ignore */ }
+  e.preventDefault();
+}
+
+function _cylinderPointerMove(e) {
+  const m = _cylinderPanelToWorld(e);
+  if (!m) return;
+
+  if (_cylDragMode) {
+    if (_cylDragMode === 'center') {
+      settings.cylinderCenterX = m.wx;
+      settings.cylinderCenterY = m.wy;
+      _scheduleCylinderPanelRedraw();
+      _scheduleCylinderPreviewUpdate();
+    } else if (_cylDragMode === 'radius') {
+      const { cx, cy } = getEffectiveCylinderCenter();
+      const dx = m.wx - cx, dy = m.wy - cy;
+      settings.cylinderRadius = Math.max(0.1, Math.sqrt(dx * dx + dy * dy));
+      _scheduleCylinderPanelRedraw();
+      _scheduleCylinderPreviewUpdate();
+    } else if (_cylDragMode === 'pan' && _cylPanelTransform) {
+      // Pan in panel pixels → translate the view's world center by the inverse
+      // of the pixel delta (drag right = view moves right = cxw decreases).
+      const dPx = m.px - _cylPanLastPx;
+      const dPy = m.py - _cylPanLastPy;
+      _cylPanelTransform.cxw -= dPx / _cylPanelTransform.scale;
+      _cylPanelTransform.cyw += dPy / _cylPanelTransform.scale; // y is flipped
+      _cylPanLastPx = m.px;
+      _cylPanLastPy = m.py;
+      _scheduleCylinderPanelRedraw();
+      // Pan doesn't change projection state — no preview update needed.
+    }
+    return;
+  }
+
+  // Not dragging — update hover state for cursor + visual affordance.
+  const handle = _cylHandleAt(m.px, m.py);
+  if (handle !== _cylHoverMode) {
+    _cylHoverMode = handle;
+    _cylinderUpdateCursor();
+    _scheduleCylinderPanelRedraw();
+  }
+}
+
+function _scheduleCylinderPreviewUpdate() {
+  if (_cylPreviewThrottle) return;
+  _cylPreviewThrottle = setTimeout(() => {
+    _cylPreviewThrottle = null;
+    updatePreview();
+    // updatePreview() mutates uniforms in place; the 3D viewport's render
+    // loop only re-draws when _needsRender flips, so push it explicitly.
+    requestRender();
+  }, 30);
+}
+
+// Mouse wheel inside the cylinder ring adjusts the radius. Multiplicative
+// scaling gives a smooth log feel — each wheel notch (~100 deltaY) changes
+// the radius by ~5%.
+function _cylinderWheel(e) {
+  if (!currentBounds || !_cylPanelTransform) return;
+  const m = _cylinderPanelToWorld(e);
+  if (!m) return;
+  // Only intercept wheel events that are actually on the cylinder gizmo, so
+  // wheel scrolling outside the ring still bubbles to whatever the user
+  // expects (page scroll, etc.).
+  const t = _cylPanelTransform;
+  const { cx, cy } = getEffectiveCylinderCenter();
+  const cpx = (cx - t.cxw) * t.scale + cylinderCanvas.width / 2;
+  const cpy = cylinderCanvas.height / 2 - (cy - t.cyw) * t.scale;
+  const dx = m.px - cpx, dy = m.py - cpy;
+  const distFromCenter = Math.sqrt(dx * dx + dy * dy);
+  const ringPx = getEffectiveCylinderRadius() * t.scale;
+  // Active wheel zone = inside the ring + a small ring-grace band.
+  if (distFromCenter > ringPx + _CYL_RING_HIT_PX) return;
+  e.preventDefault();
+  const factor = Math.pow(0.95, e.deltaY / 100);
+  settings.cylinderRadius = Math.max(0.1, getEffectiveCylinderRadius() * factor);
+  _scheduleCylinderPanelRedraw();
+  _scheduleCylinderPreviewUpdate();
+  // Wheel is a discrete gesture — persist the new value without waiting for
+  // a drag-end equivalent.
+  if (typeof _autoSaveSettings === 'function') _autoSaveSettings();
+}
+
+function _cylinderPointerLeave() {
+  if (_cylHoverMode) {
+    _cylHoverMode = null;
+    _cylinderUpdateCursor();
+    _scheduleCylinderPanelRedraw();
+  }
+}
+
+function _cylinderPointerUp(e) {
+  if (!_cylDragMode) return;
+  const wasPan = _cylDragMode === 'pan';
+  _cylDragMode = null;
+  try { cylinderCanvas.releasePointerCapture(e.pointerId); } catch { /* ignore */ }
+  _cylinderUpdateCursor();
+  _scheduleCylinderPanelRedraw();
+  if (wasPan) return; // pan doesn't change projection state
+  if (_cylPreviewThrottle) { clearTimeout(_cylPreviewThrottle); _cylPreviewThrottle = null; }
+  updatePreview();
+  requestRender();
+  // Persist the new center/radius — cylinderCanvas is outside #settings-panel,
+  // so the panel's input/change listener won't autosave for us.
+  if (typeof _autoSaveSettings === 'function') _autoSaveSettings();
+}
+
+cylinderCanvas.addEventListener('pointerdown',   _cylinderPointerDown);
+cylinderCanvas.addEventListener('pointermove',   _cylinderPointerMove);
+cylinderCanvas.addEventListener('pointerup',     _cylinderPointerUp);
+cylinderCanvas.addEventListener('pointercancel', _cylinderPointerUp);
+cylinderCanvas.addEventListener('pointerleave',  _cylinderPointerLeave);
+cylinderCanvas.addEventListener('wheel', _cylinderWheel, { passive: false });
+// Right-click is reserved for panning, so swallow the browser context menu
+// before it interrupts the drag.
+cylinderCanvas.addEventListener('contextmenu', (e) => e.preventDefault());
+
+function updateCylinderUIVisibility() {
+  const isCyl = settings.mappingMode === 3 /* MODE_CYLINDRICAL */;
+  cylinderSnapRow.style.display = isCyl ? '' : 'none';
+  cylinderAxisRow.style.display = isCyl ? '' : 'none';
+  // Show the panel whenever the user is in cylindrical mode, even without a
+  // model loaded — they get the empty placeholder until they load one, which
+  // makes it clear that the gizmo will appear there.
+  cylinderPanel.classList.toggle('hidden', !isCyl);
+  if (isCyl) {
+    if (currentGeometry) _buildCylinderSilhouette();
+    _scheduleCylinderPanelRedraw();
+  }
+}
+
+// Least-squares circle fit (Kasa method). Fits to vertices of triangles whose
+// face normal is roughly perpendicular to the cylinder axis (|n.z| < 0.5), so
+// inner bores are excluded and end-caps don't pull the fit. Returns true and
+// updates settings.cylinderCenterX/Y/cylinderRadius on success.
+function autoFitCylinderAxis() {
+  if (!currentGeometry || !currentBounds) return false;
+  const pos = currentGeometry.attributes.position.array;
+  const idx = currentGeometry.index ? currentGeometry.index.array : null;
+  const fn  = triangleFaceNormals;
+  const triCount = idx ? (idx.length / 3) : (pos.length / 9);
+
+  let n = 0;
+  let Sx = 0, Sy = 0, Sxx = 0, Syy = 0, Sxy = 0;
+  let Sxz = 0, Syz = 0, Sz = 0;
+  for (let t = 0; t < triCount; t++) {
+    const nz = fn ? fn[t * 3 + 2] : 0;
+    if (Math.abs(nz) >= 0.5) continue; // skip cap-like triangles
+    for (let v = 0; v < 3; v++) {
+      const i = idx ? idx[t * 3 + v] : (t * 3 + v);
+      const x = pos[i * 3];
+      const y = pos[i * 3 + 1];
+      const z = x * x + y * y;
+      Sx += x; Sy += y; Sxx += x * x; Syy += y * y; Sxy += x * y;
+      Sxz += x * z; Syz += y * z; Sz += z;
+      n++;
+    }
+  }
+  if (n < 10) return false;
+
+  // Solve the 3x3 normal equations for [A, B, C] where (cx, cy) = (A/2, B/2)
+  // and r = sqrt(C + cx^2 + cy^2).
+  const M = [
+    [Sxx, Sxy, Sx],
+    [Sxy, Syy, Sy],
+    [Sx,  Sy,  n ],
+  ];
+  const b = [Sxz, Syz, Sz];
+  const det = (m) =>
+      m[0][0]*(m[1][1]*m[2][2] - m[1][2]*m[2][1])
+    - m[0][1]*(m[1][0]*m[2][2] - m[1][2]*m[2][0])
+    + m[0][2]*(m[1][0]*m[2][1] - m[1][1]*m[2][0]);
+  const D = det(M);
+  if (Math.abs(D) < 1e-12) return false;
+  const colReplace = (col) => M.map((row, i) => row.map((v, j) => j === col ? b[i] : v));
+  const A = det(colReplace(0)) / D;
+  const B = det(colReplace(1)) / D;
+  const C = det(colReplace(2)) / D;
+  const cx = A / 2, cy = B / 2;
+  const r2 = C + cx * cx + cy * cy;
+  if (!Number.isFinite(r2) || r2 <= 0) return false;
+  const r = Math.sqrt(r2);
+  // Reject obviously bogus fits (e.g. degenerate symmetric input where the
+  // fit collapses to a huge or tiny radius).
+  const maxReasonable = Math.max(currentBounds.size.x, currentBounds.size.y) * 5;
+  if (r > maxReasonable || r < 1e-3) return false;
+
+  settings.cylinderCenterX = cx;
+  settings.cylinderCenterY = cy;
+  settings.cylinderRadius  = r;
+  return true;
 }
 
 // ── Init ──────────────────────────────────────────────────────────────────────
@@ -384,6 +880,9 @@ function populateLanguageSelector() {
       if (lastFastDiag) renderFastDiag(lastFastDiag);
       if (lastAdvancedDiag) renderAdvancedDiag(lastAdvancedDiag);
     }
+    // The cylinder panel paints its placeholder text via Canvas2D, which
+    // applyTranslations() doesn't reach — re-render so the new locale lands.
+    _scheduleCylinderPanelRedraw();
   });
 
   languageSelector.appendChild(select);
@@ -665,7 +1164,10 @@ function trapFocus(overlay) {
 function wireEvents() {
   // ── Model loading ──
   stlFileInput.addEventListener('change', (e) => {
-    if (e.target.files[0]) handleModelFile(e.target.files[0]);
+    const file = e.target.files[0];
+    if (!file) return;
+    e.target.value = '';
+    handleModelFile(file);
   });
 
   // Drag & drop on the viewport section
@@ -743,7 +1245,47 @@ function wireEvents() {
   mappingSelect.addEventListener('change', () => {
     settings.mappingMode = parseInt(mappingSelect.value, 10);
     capAngleRow.style.display = settings.mappingMode === 3 ? '' : 'none';
+    updateCylinderUIVisibility();
     updatePreview();
+  });
+
+  cylinderSnapToggle.addEventListener('change', () => {
+    settings.snapSeamlessWrap = cylinderSnapToggle.checked;
+    if (settings.snapSeamlessWrap && settings.mappingMode === 3) {
+      // Snap immediately so the user sees the seam fix without dragging first.
+      _applyScaleU(settings.scaleU);
+    }
+  });
+
+  cylinderAutofitBtn.addEventListener('click', () => {
+    if (autoFitCylinderAxis()) {
+      _scheduleCylinderPanelRedraw();
+      updatePreview();
+      requestRender();
+      _autoSaveSettings();
+    }
+  });
+
+  cylinderPanelMinimize.addEventListener('click', () => {
+    settings.cylinderPanelMinimized = !settings.cylinderPanelMinimized;
+    cylinderPanel.classList.toggle('minimized', settings.cylinderPanelMinimized);
+    if (!settings.cylinderPanelMinimized) _scheduleCylinderPanelRedraw();
+    _autoSaveSettings();
+  });
+
+  cylinderResetBtn.addEventListener('click', () => {
+    settings.cylinderCenterX = null;
+    settings.cylinderCenterY = null;
+    settings.cylinderRadius  = null;
+    // Also undo any panning so the silhouette returns to its default framing.
+    if (_cylSilhouetteAnchor && _cylPanelTransform) {
+      _cylPanelTransform.cxw = _cylSilhouetteAnchor.cxw;
+      _cylPanelTransform.cyw = _cylSilhouetteAnchor.cyw;
+    }
+    _scheduleCylinderPanelRedraw();
+    updatePreview();
+    requestRender();
+    _autoSaveSettings();
   });
 
   // Scale U — when lock is on, mirror to V
@@ -1577,6 +2119,14 @@ function handlePlaceOnFaceClick(e) {
 
   // Now reload as if this were a freshly loaded STL
   currentBounds = computeBounds(currentGeometry);
+  // Geometry rotated — cylinder axis settings tied to old XY are stale.
+  settings.cylinderCenterX = null;
+  settings.cylinderCenterY = null;
+  settings.cylinderRadius  = null;
+  _cylSilhouetteCanvas = null;
+  _cylSilhouetteGeometry = null;
+  _cylSilhouetteAnchor = null;
+  updateCylinderUIVisibility();
   checkAmplitudeWarning();
   checkResolutionWarning();
 
@@ -1777,6 +2327,14 @@ function _rotateFinalize() {
   // Full refresh
   currentBounds = computeBounds(currentGeometry);
   loadGeometry(currentGeometry);
+
+  // Geometry was reauthored (displacement baked in); cylinder silhouette
+  // bitmap is stale. Settings are kept so the user's axis placement still
+  // applies — the part shape didn't change in plan view, only Z displacement.
+  _cylSilhouetteCanvas = null;
+  _cylSilhouetteGeometry = null;
+  _cylSilhouetteAnchor = null;
+  updateCylinderUIVisibility();
 
   // Rebuild adjacency for exclusion tools
   const adjData = buildAdjacency(currentGeometry);
@@ -2172,6 +2730,17 @@ async function handleModelFile(file) {
     }
     mappingSelect.value = String(settings.mappingMode);
     capAngleRow.style.display = settings.mappingMode === 3 ? '' : 'none';
+
+    // Fresh model → reset cylinder axis to AABB defaults so the gizmo lands on
+    // a sensible starting point. (Project snapshot restore overrides this
+    // afterwards if it has explicit cylinderCenterX/Y/radius values.)
+    settings.cylinderCenterX = null;
+    settings.cylinderCenterY = null;
+    settings.cylinderRadius  = null;
+    _cylSilhouetteCanvas = null;
+    _cylSilhouetteGeometry = null;
+    _cylSilhouetteAnchor = null;
+    updateCylinderUIVisibility();
 
     // Show mesh with a default material until a map is selected
     loadGeometry(geometry);
@@ -3745,6 +4314,10 @@ const PERSISTED_KEYS = [
   'mappingBlend', 'seamBandWidth', 'capAngle', 'boundaryFalloff',
   'bottomAngleLimit', 'topAngleLimit',
   'refineLength', 'maxTriangles',
+  // Cylindrical-mode controls. cylinderCenterX/Y/radius are nullable —
+  // null means "fall back to AABB defaults", which is what fresh loads get.
+  'snapSeamlessWrap', 'cylinderCenterX', 'cylinderCenterY', 'cylinderRadius',
+  'cylinderPanelMinimized',
 ];
 
 function getSettingsSnapshot() {
@@ -3828,6 +4401,21 @@ function applySettingsSnapshot(snap) {
     symmetricDispToggle.checked = snap.symmetricDisplacement;
     symmetricDispToggle.dispatchEvent(new Event('change', { bubbles: true }));
   }
+
+  // Cylindrical-mode state. cylinderCenterX/Y/radius pass through unchanged
+  // (null is meaningful — falls back to AABB defaults during projection).
+  if (snap.snapSeamlessWrap != null) {
+    settings.snapSeamlessWrap = !!snap.snapSeamlessWrap;
+    if (cylinderSnapToggle) cylinderSnapToggle.checked = settings.snapSeamlessWrap;
+  }
+  if ('cylinderCenterX' in snap) settings.cylinderCenterX = snap.cylinderCenterX;
+  if ('cylinderCenterY' in snap) settings.cylinderCenterY = snap.cylinderCenterY;
+  if ('cylinderRadius'  in snap) settings.cylinderRadius  = snap.cylinderRadius;
+  if ('cylinderPanelMinimized' in snap) {
+    settings.cylinderPanelMinimized = !!snap.cylinderPanelMinimized;
+    cylinderPanel.classList.toggle('minimized', settings.cylinderPanelMinimized);
+  }
+  updateCylinderUIVisibility();
 }
 
 /**
@@ -3896,6 +4484,9 @@ const DEFAULT_SETTINGS_SNAPSHOT = Object.freeze({
   mappingBlend: 1, seamBandWidth: 0.5, capAngle: 20, boundaryFalloff: 0,
   bottomAngleLimit: 5, topAngleLimit: 0,
   refineLength: 1, maxTriangles: 750000,
+  snapSeamlessWrap: true,
+  cylinderCenterX: null, cylinderCenterY: null, cylinderRadius: null,
+  cylinderPanelMinimized: false,
   activeMapName: DEFAULT_PRESET_NAME,
 });
 

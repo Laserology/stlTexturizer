@@ -831,6 +831,99 @@ input[type="number"].val:focus { outline: none; border-color: var(--accent); }
   color: #f59e0b;
 }
 
+/* ── Cylinder axis inset panel ─────────────────────────────────────────── */
+
+.cylinder-panel {
+  position: absolute;
+  top: 14px;
+  left: 14px;
+  width: 240px;
+  height: 276px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  z-index: 22;
+  pointer-events: all;
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.25);
+  overflow: hidden;
+  user-select: none;
+  display: flex;
+  flex-direction: column;
+}
+
+.cylinder-panel.hidden { display: none; }
+
+.cylinder-panel canvas {
+  display: block;
+  width: 240px;
+  height: 240px;
+  cursor: grab;
+  touch-action: none;
+}
+
+/* Width stays the same when minimized; only the canvas collapses away. */
+.cylinder-panel.minimized { height: auto; }
+.cylinder-panel.minimized canvas { display: none; }
+
+.cylinder-panel-label {
+  font-size: 10px;
+  color: var(--text-muted);
+  padding: 6px 8px;
+  flex: 1;
+  letter-spacing: 0.02em;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-height: 24px;
+}
+
+.cylinder-panel-minimize {
+  width: 18px;
+  height: 18px;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  color: var(--text-muted);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  flex-shrink: 0;
+}
+.cylinder-panel-minimize:hover {
+  background: var(--accent);
+  color: #fff;
+  border-color: var(--accent);
+}
+/* Toggle which icon is visible based on the panel's minimized state. */
+.cylinder-panel-minimize .icon-expand   { display: none; }
+.cylinder-panel.minimized .cylinder-panel-minimize .icon-minimize { display: none; }
+.cylinder-panel.minimized .cylinder-panel-minimize .icon-expand   { display: inline-block; }
+
+.cylinder-axis-controls {
+  display: flex;
+  gap: 6px;
+  flex: 1;
+}
+
+.cylinder-axis-btn {
+  flex: 1;
+  padding: 4px 8px;
+  font-size: 11px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+  cursor: pointer;
+}
+.cylinder-axis-btn:hover {
+  background: var(--accent);
+  color: #fff;
+  border-color: var(--accent);
+}
+
 /* ── Mesh diagnostics popup ────────────────────────────────────────────── */
 
 .mesh-diagnostics {

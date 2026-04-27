@@ -142,10 +142,14 @@ export function computeUV(pos, normal, mode, settings, bounds) {
     case MODE_CYLINDRICAL: {
       // mappingBlend=0 → pure side projection for all faces (original behaviour, no cap seam).
       // mappingBlend>0 → smooth side↔cap blend.
-      const r  = Math.max(size.x, size.y) * 0.5;
-      const C  = TWO_PI * Math.max(r, 1e-6);
-      const rx = pos.x - center.x;
-      const ry = pos.y - center.y;
+      // Cylinder axis is +Z. Center XY and radius default to the AABB but can
+      // be overridden so partial cylinders (pie slices) project undistorted.
+      const cx = settings.cylinderCenterX ?? center.x;
+      const cy = settings.cylinderCenterY ?? center.y;
+      const r  = Math.max(settings.cylinderRadius ?? Math.max(size.x, size.y) * 0.5, 1e-6);
+      const C  = TWO_PI * r;
+      const rx = pos.x - cx;
+      const ry = pos.y - cy;
       const blend = settings.mappingBlend ?? 0.0;
       const theta = Math.atan2(ry, rx);
       const uRaw = (theta / TWO_PI) + 0.5;
