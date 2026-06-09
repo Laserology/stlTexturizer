@@ -13,6 +13,7 @@ import { subdivide }          from './subdivision.js';
 import { regularizeMesh }     from './regularize.js';
 import { applyDisplacement }  from './displacement.js';
 import { decimate }           from './decimation.js';
+import { resolveTJunctions, countEdgeDefects, countAreaSlivers } from './meshRepair.js';
 import { exportSTL, export3MF } from './exporter.js';
 import { buildAdjacency, bucketFill,
          buildExclusionOverlayGeo, buildFaceWeights } from './exclusion.js';
@@ -91,6 +92,8 @@ const settings = {
   symmetricDisplacement: false,
   noDownwardZ: false,
   smoothBottom: true,
+  harvestFlatFaces: true,
+  harvestTol: 0.005,
   useDisplacement: false,
   // Cylindrical-mode controls.
   // null/undefined → derive from bounds (preserves legacy / non-cylindrical behavior).
@@ -305,6 +308,9 @@ const symmetricDispToggle    = document.getElementById('symmetric-displacement')
 const dispPreviewToggle      = document.getElementById('displacement-preview');
 const noDownwardZChk         = document.getElementById('no-downward-z-chk');
 const smoothBottomChk        = document.getElementById('smooth-bottom-chk');
+const harvestFlatChk         = document.getElementById('harvest-flat-chk');
+const harvestTolInput        = document.getElementById('harvest-tol');
+const harvestTolRow          = document.getElementById('harvest-tol-row');
 const regularizeEnabledChk   = document.getElementById('regularize-enabled-chk');
 const regularizeDebugRows    = document.getElementById('regularize-debug-rows');
 const regAspectThresholdEl   = document.getElementById('reg-aspect-threshold');
@@ -1411,6 +1417,19 @@ function wireEvents() {
   smoothBottomChk.addEventListener('change', () => {
     settings.smoothBottom = smoothBottomChk.checked;
     // No preview rebuild needed — the snap is a final-export step only.
+  });
+  harvestFlatChk.checked = settings.harvestFlatFaces;
+  harvestTolRow.classList.toggle('disabled', !settings.harvestFlatFaces);
+  harvestFlatChk.addEventListener('change', () => {
+    settings.harvestFlatFaces = harvestFlatChk.checked;
+    harvestTolRow.classList.toggle('disabled', !settings.harvestFlatFaces);
+    // No preview rebuild needed — harvesting only affects the final decimation.
+  });
+  harvestTolInput.value = settings.harvestTol;
+  harvestTolInput.addEventListener('input', () => {
+    const v = parseFloat(harvestTolInput.value);
+    if (Number.isFinite(v) && v >= 0) settings.harvestTol = v;
+    // No preview rebuild needed — harvesting only affects the final decimation.
   });
 
   // Regularize (Advanced/Beta) — toggle + 7 debug knobs.  The toggle disables
@@ -4469,19 +4488,31 @@ async function handleExport(format = 'stl') {
     triLimitWarning.textContent = t('warnings.safetyCapHit');
 
     finalGeometry = displaced;
-    if (needsDecimation) {
-      setProgress(0.71, t('progress.decimatingTo', { from: dispTriCount.toLocaleString(), to: settings.maxTriangles.toLocaleString() }));
+    // Run when over the target (true decimation) OR when only flat-face
+    // harvesting is needed — harvesting collapses free flat faces even when the
+    // mesh is already under the Output-Triangles limit.
+    const runDecimation = needsDecimation || settings.harvestFlatFaces;
+    if (runDecimation) {
+      setProgress(0.71, needsDecimation
+        ? t('progress.decimatingTo', { from: dispTriCount.toLocaleString(), to: settings.maxTriangles.toLocaleString() })
+        : t('progress.harvestingFlat'));
       finalGeometry = await runAsync(() =>
         decimate(
           displaced,
           settings.maxTriangles,
           (p) => {
-            const cur = Math.round(dispTriCount - (dispTriCount - settings.maxTriangles) * p);
-            setProgress(
-              0.71 + p * 0.25,
-              t('progress.decimating', { cur: cur.toLocaleString(), to: settings.maxTriangles.toLocaleString() })
-            );
-          }
+            if (needsDecimation) {
+              const cur = Math.round(dispTriCount - (dispTriCount - settings.maxTriangles) * p);
+              setProgress(
+                0.71 + p * 0.25,
+                t('progress.decimating', { cur: cur.toLocaleString(), to: settings.maxTriangles.toLocaleString() })
+              );
+            } else {
+              setProgress(0.71 + p * 0.25, t('progress.harvestingFlat'));
+            }
+          },
+          settings.harvestFlatFaces,
+          settings.harvestTol
         )
       );
       // Free pre-decimation geometry — decimate created a separate copy
@@ -4527,6 +4558,36 @@ async function handleExport(format = 'stl') {
     // two complement each other when both are active.
     if (settings.smoothBottom) {
       snapBottomToFlat(finalGeometry, currentBounds.min.z, 0.1);
+    }
+
+    // Resolve T-junctions so the export is watertight & manifold. Decimation (and
+    // the bottom snaps above) can leave a long edge meeting several short ones
+    // across split seams — open edges that no weld tolerance can fix. This splits
+    // those long edges at the on-edge vertices, restoring shared topology. Only
+    // run on the decimated (sparse) mesh — welding the dense pre-decimation mesh
+    // at the export grid would instead collapse its fine detail into degenerates.
+    if (runDecimation) {
+      setProgress(0.96, t('progress.repairingMesh'));
+      await yieldFrame();
+      const beforeSlivers = countAreaSlivers(finalGeometry);
+      const repaired = resolveTJunctions(finalGeometry);
+      finalGeometry.dispose();
+      finalGeometry = repaired;
+      const after = countEdgeDefects(finalGeometry);
+      const afterSlivers = countAreaSlivers(finalGeometry);
+      // Ground-truth readout from the live browser. The decisive number is
+      // `afterSlivers`: zero-area "needle" triangles read as watertight here but
+      // every slicer (and our own importer) deletes them, punching a hole at each
+      // — that was the real cause of the open-edge warning on re-imported files.
+      // After repair both `afterSlivers` and `after.open` must be 0.
+      console.log(
+        `%c[stlTexturizer] mesh repair (build 2026-06-09c): ` +
+        `removed ${beforeSlivers.toLocaleString()} zero-area slivers; ` +
+        `final open=${after.open}, non-manifold=${after.nonManifold}, slivers=${afterSlivers} ` +
+        `(${after.tris.toLocaleString()} tris)`,
+        'color:#0a0;font-weight:bold'
+      );
+      if (exportToken !== myToken) return;
     }
 
     const texLabel = activeMapEntry.isCustom ? 'custom' : activeMapEntry.name.replace(/\s+/g, '-');
@@ -4978,7 +5039,7 @@ const PERSISTED_KEYS = [
   'mappingMode', 'scaleU', 'scaleV', 'lockScale',
   'offsetU', 'offsetV', 'rotation',
   'amplitude', 'textureHeight', 'invertDisplacement',
-  'symmetricDisplacement', 'noDownwardZ', 'smoothBottom', 'textureSmoothing',
+  'symmetricDisplacement', 'noDownwardZ', 'smoothBottom', 'harvestFlatFaces', 'harvestTol', 'textureSmoothing',
   'mappingBlend', 'seamBandWidth', 'capAngle', 'boundaryFalloff',
   'bottomAngleLimit', 'topAngleLimit',
   'refineLength', 'maxTriangles',
@@ -5077,6 +5138,14 @@ function applySettingsSnapshot(snap) {
     smoothBottomChk.checked = snap.smoothBottom;
     smoothBottomChk.dispatchEvent(new Event('change', { bubbles: true }));
   }
+  if (snap.harvestFlatFaces != null) {
+    harvestFlatChk.checked = snap.harvestFlatFaces;
+    harvestFlatChk.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+  if (snap.harvestTol != null) {
+    harvestTolInput.value = snap.harvestTol;
+    harvestTolInput.dispatchEvent(new Event('input', { bubbles: true }));
+  }
 
   // Cylindrical-mode state. cylinderCenterX/Y/radius pass through unchanged
   // (null is meaningful — falls back to AABB defaults during projection).
@@ -5156,7 +5225,7 @@ const DEFAULT_SETTINGS_SNAPSHOT = Object.freeze({
   mappingMode: 5, scaleU: 0.5, scaleV: 0.5, lockScale: true,
   offsetU: 0, offsetV: 0, rotation: 0,
   amplitude: 0.5, textureHeight: 0.5, invertDisplacement: false,
-  symmetricDisplacement: false, noDownwardZ: false, smoothBottom: true, textureSmoothing: 0,
+  symmetricDisplacement: false, noDownwardZ: false, smoothBottom: true, harvestFlatFaces: true, harvestTol: 0.005, textureSmoothing: 0,
   mappingBlend: 1, seamBandWidth: 0.5, capAngle: 20, boundaryFalloff: 0,
   bottomAngleLimit: 5, topAngleLimit: 0,
   refineLength: 1, maxTriangles: 750000,

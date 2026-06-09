@@ -1318,6 +1318,10 @@ input[type="number"].val:focus { outline: none; border-color: var(--accent); }
   opacity: 0.45;
   pointer-events: none;
 }
+#harvest-tol-row.disabled {
+  opacity: 0.45;
+  pointer-events: none;
+}
 
 /* Debug stats for last picked triangle in masking mode */
 .masking-tri-debug {
