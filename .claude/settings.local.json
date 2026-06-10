@@ -46,7 +46,20 @@
       "WebFetch(domain:raw.githubusercontent.com)",
       "Bash(node test-cylindrical.mjs)",
       "Bash(node --check js/mapping.js)",
-      "Bash(node --check js/previewMaterial.js)"
+      "Bash(node --check js/previewMaterial.js)",
+      "Bash(node -e \"console.log\\(process.version\\)\")",
+      "Bash(npm init *)",
+      "Bash(node test-fillet-debug.mjs)",
+      "Bash(node test-fillet-quant.mjs)",
+      "Bash(node test-fillet-quant-sweep.mjs)",
+      "Bash(node test-sliver-collapse.mjs)",
+      "Bash(node test-smooth-bottom.mjs)",
+      "Bash(node test-laserplate-diag.mjs)",
+      "Bash(node --max-old-space-size=8192 test-puerta-debug.mjs)",
+      "Bash(node --max-old-space-size=8192 test-laserplate.mjs)",
+      "Bash(node --max-old-space-size=8192 bench-tri-estimate.mjs)",
+      "Bash(node --max-old-space-size=8192 bench-sim-timing.mjs)",
+      "Bash(node --max-old-space-size=8192 -e ' *)"
     ]
   }
 }

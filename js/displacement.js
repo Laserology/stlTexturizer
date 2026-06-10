@@ -44,7 +44,11 @@ export function applyDisplacement(geometry, imageData, imgWidth, imgHeight, sett
   const aspectV = tmax / Math.max(imgHeight, 1);
   const settingsWithAspect = { ...settings, textureAspectU: aspectU, textureAspectV: aspectV };
 
-  const QUANT = 1e4;
+  // 10 µm vertex-dedup cells. Must match subdivision.js QUANTISE so the
+  // displacement pipeline sees the same vertex-uniqueness that subdivision
+  // produced — coarser cells (1e4) collapsed real fillet vertices on small
+  // models, creating needle artifacts and non-manifold edges.
+  const QUANT = 1e5;
 
   // ── WHY GAPS HAPPEN ───────────────────────────────────────────────────────
   // The mesh is non-indexed (unrolled): every triangle has its own copy of
@@ -188,10 +192,102 @@ export function applyDisplacement(geometry, imageData, imgWidth, imgHeight, sett
     }
   }
 
-  // Normalise each accumulated normal
+  // Normalise each accumulated normal — also remember the pre-normalisation
+  // magnitude relative to the total face area at that position. A ratio near
+  // 1 means all neighbouring face normals point the same way (the smooth
+  // normal is a reliable surface direction); near 0 means opposing normals
+  // cancelled out (knife-edge / thin plate). The cubic sampler uses the ratio
+  // to decide whether the smooth normal can drive blend weights or whether
+  // the per-face zoneArea fallback is needed.
+  const smoothNrmReliability = new Float64Array(uniqueCount);
   for (let id = 0; id < uniqueCount; id++) {
-    const len = Math.sqrt(smoothNrmX[id]*smoothNrmX[id] + smoothNrmY[id]*smoothNrmY[id] + smoothNrmZ[id]*smoothNrmZ[id]) || 1;
-    smoothNrmX[id] /= len; smoothNrmY[id] /= len; smoothNrmZ[id] /= len;
+    const len = Math.sqrt(smoothNrmX[id]*smoothNrmX[id] + smoothNrmY[id]*smoothNrmY[id] + smoothNrmZ[id]*smoothNrmZ[id]);
+    const tA  = maskedFracTotal[id];
+    smoothNrmReliability[id] = (len > 0 && tA > 0) ? len / tA : 0;
+    const inv = len > 0 ? 1 / len : 1;
+    smoothNrmX[id] *= inv; smoothNrmY[id] *= inv; smoothNrmZ[id] *= inv;
+  }
+
+  // ── Pass 1.5: Laplacian-smoothed BLEND normal ─────────────────────────────
+  // The displacement direction (Pass 3) must remain the accurate per-vertex
+  // smooth normal — otherwise watertight copies of the same position move
+  // differently and you get cracks. But the normal used to derive
+  // *projection-direction blend weights* only needs to vary slowly across
+  // the surface. On organic / sculpted meshes the smooth normal still has
+  // high-frequency jitter (a few degrees vertex-to-vertex). Inside the
+  // blend band (where ∂w/∂n is largest) that jitter multiplies the
+  // difference between two unrelated heightmap samples (hA - hB), producing
+  // visible seam noise even when the underlying texture is not at fault.
+  //
+  // Smoothing the blend normal kills this amplification at the source. On a
+  // sphere the smoothing is a no-op (already smooth); on a noisy surface it
+  // damps the jitter that drives ∂w. Direction info is preserved because we
+  // re-normalise after each iteration.
+  const blendNrmIters = Math.max(0, Math.floor(settings.blendNormalSmoothing ?? 0));
+  let blendNrmX = smoothNrmX, blendNrmY = smoothNrmY, blendNrmZ = smoothNrmZ;
+  if (blendNrmIters > 0) {
+    // Build dedup-graph adjacency in CSR form: each triangle contributes
+    // 3 directed edges; we build a multigraph (duplicates keep their natural
+    // weight from how often two positions share an edge — i.e., shared
+    // surfaces accumulate higher coupling, which is what we want).
+    // For each unique-vertex id, neighbors[csrStart[id]..csrStart[id+1])
+    // is the contiguous slice of neighbour ids.
+    const degree = new Uint32Array(uniqueCount);
+    for (let t = 0; t < count; t += 3) {
+      const a = vertexId[t], b = vertexId[t + 1], c = vertexId[t + 2];
+      if (a !== b) { degree[a]++; degree[b]++; }
+      if (b !== c) { degree[b]++; degree[c]++; }
+      if (c !== a) { degree[c]++; degree[a]++; }
+    }
+    const csrStart = new Uint32Array(uniqueCount + 1);
+    for (let id = 0; id < uniqueCount; id++) csrStart[id + 1] = csrStart[id] + degree[id];
+    const totalEdges = csrStart[uniqueCount];
+    const neighbors = new Uint32Array(totalEdges);
+    const cursor = new Uint32Array(uniqueCount);
+    for (let t = 0; t < count; t += 3) {
+      const a = vertexId[t], b = vertexId[t + 1], c = vertexId[t + 2];
+      if (a !== b) { neighbors[csrStart[a] + cursor[a]++] = b; neighbors[csrStart[b] + cursor[b]++] = a; }
+      if (b !== c) { neighbors[csrStart[b] + cursor[b]++] = c; neighbors[csrStart[c] + cursor[c]++] = b; }
+      if (c !== a) { neighbors[csrStart[c] + cursor[c]++] = a; neighbors[csrStart[a] + cursor[a]++] = c; }
+    }
+
+    // Laplacian smoothing on a writable copy. Read from current, write to
+    // next, swap. Each iteration: average over neighbours, re-normalise.
+    let curX = new Float64Array(smoothNrmX);
+    let curY = new Float64Array(smoothNrmY);
+    let curZ = new Float64Array(smoothNrmZ);
+    let nxtX = new Float64Array(uniqueCount);
+    let nxtY = new Float64Array(uniqueCount);
+    let nxtZ = new Float64Array(uniqueCount);
+
+    for (let iter = 0; iter < blendNrmIters; iter++) {
+      for (let id = 0; id < uniqueCount; id++) {
+        const s = csrStart[id], e = csrStart[id + 1];
+        if (e === s) {
+          nxtX[id] = curX[id]; nxtY[id] = curY[id]; nxtZ[id] = curZ[id];
+          continue;
+        }
+        let sx = 0, sy = 0, sz = 0;
+        for (let k = s; k < e; k++) {
+          const nb = neighbors[k];
+          sx += curX[nb]; sy += curY[nb]; sz += curZ[nb];
+        }
+        const inv = 1 / (e - s);
+        sx *= inv; sy *= inv; sz *= inv;
+        const len = Math.sqrt(sx*sx + sy*sy + sz*sz);
+        if (len > 1e-12) {
+          const r = 1 / len;
+          nxtX[id] = sx * r; nxtY[id] = sy * r; nxtZ[id] = sz * r;
+        } else {
+          // Neighbour normals cancelled (knife-edge) — keep current.
+          nxtX[id] = curX[id]; nxtY[id] = curY[id]; nxtZ[id] = curZ[id];
+        }
+      }
+      const tx = curX, ty = curY, tz = curZ;
+      curX = nxtX; curY = nxtY; curZ = nxtZ;
+      nxtX = tx;   nxtY = ty;   nxtZ = tz;
+    }
+    blendNrmX = curX; blendNrmY = curY; blendNrmZ = curZ;
   }
 
   // ── Boundary falloff distance field ──────────────────────────────────────────
@@ -323,50 +419,74 @@ export function applyDisplacement(geometry, imageData, imgWidth, imgHeight, sett
 
     tmpPos.fromBufferAttribute(posAttr, i);
 
-    // Cubic: zone-area-weighted sampling with a stable per-face dominant axis.
-    // Non-seam vertices use their single zone purely; seam-edge vertices that
-    // adjoin two zones get a face-area-proportional blend.  This guarantees all
-    // three vertices of every triangle receive consistent displacement, making
-    // the mesh watertight with no mixed-projection artefact rows at the seam.
+    // Cubic: derive blend weights from the *smooth* per-vertex normal so that
+    // adjacent vertices on a curved region (small fillets, rolled edges) see
+    // smoothly varying weights — this matches the per-fragment behaviour of
+    // the preview shader. The previous implementation summed per-face zone
+    // weights into per-vertex zoneArea[X|Y|Z]; on small fillets those sums
+    // change abruptly between neighbours because each face's dominant-axis
+    // membership is binary, which produced jagged "needle" displacement.
     //
-    // Always use this path regardless of mappingBlend.  The smooth normals from
-    // subdivision can be wrong on thin structures (e.g. a flat base plate) where
-    // top (0,0,1) and bottom (0,0,-1) face normals cancel at shared edge vertices,
-    // leaving a horizontal smooth normal.  computeUV would then pick the wrong
-    // cubic projection axis, making those faces appear untextured.  The face-
-    // normal-based zoneArea arrays are immune to this because they classify faces
-    // by their geometric cross-product normal, not the averaged vertex normal.
+    // The thin-plate edge case (top + bottom face normals cancel at a shared
+    // knife-edge vertex, leaving the smooth normal nearly zero) still needs
+    // the per-face zoneArea path. We detect that via smoothNrmReliability —
+    // length(rawSmoothNormal) / totalFaceArea, in [0, 1]. Surfaces with all
+    // normals broadly aligned read ≈1; perfectly cancelling pairs read 0.
+    // 0.5 is loose enough that a 90° cube edge (≈0.71) still uses the smooth
+    // path, but a near-180° fold falls back to face-area zones.
     if (settings.mappingMode === 6 /* MODE_CUBIC */) {
-      const zaX = zoneAreaX[vid], zaY = zoneAreaY[vid], zaZ = zoneAreaZ[vid];
-      const total = zaX + zaY + zaZ;
-      if (total > 0) {
-        const md = Math.max(bounds.size.x, bounds.size.y, bounds.size.z, 1e-6);
-        const rotRad = (settings.rotation ?? 0) * Math.PI / 180;
+      const md = Math.max(bounds.size.x, bounds.size.y, bounds.size.z, 1e-6);
+      const rotRad = (settings.rotation ?? 0) * Math.PI / 180;
+      const cubicBlend = settings.mappingBlend ?? 0;
+      const cubicBandWidth = settings.seamBandWidth ?? 0.35;
+
+      let wX = 0, wY = 0, wZ = 0;
+      if (smoothNrmReliability[vid] > 0.5) {
+        const sn = { x: blendNrmX[vid], y: blendNrmY[vid], z: blendNrmZ[vid] };
+        const w = getCubicBlendWeights(sn, cubicBlend, cubicBandWidth);
+        wX = w.x; wY = w.y; wZ = w.z;
+      } else {
+        const zaX = zoneAreaX[vid], zaY = zoneAreaY[vid], zaZ = zoneAreaZ[vid];
+        const total = zaX + zaY + zaZ;
+        if (total > 0) { wX = zaX/total; wY = zaY/total; wZ = zaZ/total; }
+      }
+
+      if (wX + wY + wZ > 0) {
         let grey = 0;
-        if (zaX > 0) { // X-dominant zone → YZ projection
+        // U-flip uses the *original* smoothNrm — it's a discrete sign decision
+        // about which face of the cube this vertex sits on. The smoothed blend
+        // normal can have small components flip sign during Laplacian smoothing
+        // (e.g. for vertices near the equator x≈0), which would mirror their
+        // texture sample relative to the true surface orientation.
+        if (wX > 0) { // X-dominant → YZ projection
           let rawU = (tmpPos.y-bounds.min.y)/md;
-          if (smoothNrmX[vid] < 0) rawU = -rawU; // flip U for -X faces
+          if (smoothNrmX[vid] < 0) rawU = -rawU;
           const uv = _cubicUV(rawU, (tmpPos.z-bounds.min.z)/md, settings, rotRad, aspectU, aspectV);
-          grey += sampleBilinear(imageData.data, imgWidth, imgHeight, uv.u, uv.v) * (zaX/total);
+          grey += sampleBilinear(imageData.data, imgWidth, imgHeight, uv.u, uv.v) * wX;
         }
-        if (zaY > 0) { // Y-dominant zone → XZ projection
+        if (wY > 0) { // Y-dominant → XZ projection
           let rawU = (tmpPos.x-bounds.min.x)/md;
-          if (smoothNrmY[vid] > 0) rawU = -rawU; // flip U for +Y faces
+          if (smoothNrmY[vid] > 0) rawU = -rawU;
           const uv = _cubicUV(rawU, (tmpPos.z-bounds.min.z)/md, settings, rotRad, aspectU, aspectV);
-          grey += sampleBilinear(imageData.data, imgWidth, imgHeight, uv.u, uv.v) * (zaY/total);
+          grey += sampleBilinear(imageData.data, imgWidth, imgHeight, uv.u, uv.v) * wY;
         }
-        if (zaZ > 0) { // Z-dominant zone → XY projection
+        if (wZ > 0) { // Z-dominant → XY projection
           let rawU = (tmpPos.x-bounds.min.x)/md;
-          if (smoothNrmZ[vid] < 0) rawU = -rawU; // flip U for -Z faces
+          if (smoothNrmZ[vid] < 0) rawU = -rawU;
           const uv = _cubicUV(rawU, (tmpPos.y-bounds.min.y)/md, settings, rotRad, aspectU, aspectV);
-          grey += sampleBilinear(imageData.data, imgWidth, imgHeight, uv.u, uv.v) * (zaZ/total);
+          grey += sampleBilinear(imageData.data, imgWidth, imgHeight, uv.u, uv.v) * wZ;
         }
         dispCacheVal[vid] = grey;
         continue;
       }
     }
 
-    tmpNrm.set(smoothNrmX[vid], smoothNrmY[vid], smoothNrmZ[vid]);
+    // Triplanar / cylindrical seam blends use the SMOOTHED blend normal so
+    // adjacent vertices in a blend zone don't see jittery weights driven by
+    // mesh-noise. Other modes ignore the normal for blending, so this is a
+    // no-op there. Displacement direction (Pass 3) stays on the unsmoothed
+    // smooth normal — only blend weights change here.
+    tmpNrm.set(blendNrmX[vid], blendNrmY[vid], blendNrmZ[vid]);
 
     const uvResult = computeUV(tmpPos, tmpNrm, settings.mappingMode, settingsWithAspect, bounds);
     let grey;
@@ -417,6 +537,24 @@ export function applyDisplacement(geometry, imageData, imgWidth, imgHeight, sett
     if (maskedFrac > 0) {
       if (settings.bottomAngleLimit > 0 && newZ < tmpPos.z) newZ = tmpPos.z;
       if (settings.topAngleLimit    > 0 && newZ > tmpPos.z) newZ = tmpPos.z;
+    }
+
+    // Overhang protection: never move a vertex below its original Z. X/Y
+    // displacement is preserved so surface texture detail still appears,
+    // it just gets pushed sideways instead of creating a new overhang.
+    if (settings.noDownwardZ && newZ < tmpPos.z) newZ = tmpPos.z;
+
+    // Bottom-plane flat clamp: with overhang protection on, also clamp
+    // upward motion when the original vertex sat on the print bottom plane.
+    // Without this, a downward-facing face (smoothNrm ≈ (0,0,-1)) pulls UP
+    // when the texture sample is below mid-grey (centeredGrey < 0 makes
+    // smoothNrm × disp positive in Z), so adjacent bottom-face vertices
+    // end up at slightly different heights and slicers render the now-
+    // tilted triangles with visibly varying shading. The clamp keeps the
+    // bed-contact surface a single Z value while leaving any vertex above
+    // the bottom plane (side fillets, etc.) free to follow texture detail.
+    if (settings.noDownwardZ && tmpPos.z <= bounds.min.z + 1e-5) {
+      newZ = tmpPos.z;
     }
 
     newPos[i*3]   = newX;

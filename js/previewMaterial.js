@@ -39,6 +39,7 @@ const sharedGLSL = /* glsl */`
   uniform float     seamBandWidth;
   uniform float     capAngle;
   uniform int       symmetricDisplacement;
+  uniform int       noDownwardZ;
   uniform int       useDisplacement;
   uniform vec2      textureAspect;
 
@@ -61,7 +62,11 @@ const sharedGLSL = /* glsl */`
                     : axis == 1 ? max(absN.x, absN.z)
                                 : max(absN.x, absN.y);
 
-    if (mappingBlend < 0.001 || primary - secondary <= CUBIC_AXIS_EPSILON) {
+    // blend=0: hard one-hot for sharp seams. Do NOT also short-circuit at
+    // primary≈secondary when blend>0 — the smooth branch produces 0.5/0.5
+    // there, and short-circuiting to one-hot creates a single-fragment spike
+    // wherever a fillet's smooth normal lands exactly on the 45° tie.
+    if (mappingBlend < 0.001) {
       if (axis == 0) return vec3(1.0, 0.0, 0.0);
       if (axis == 1) return vec3(0.0, 1.0, 0.0);
       return vec3(0.0, 0.0, 1.0);
@@ -247,6 +252,8 @@ const vertexShader = /* glsl */`
       // arrive at the same point (watertight, no cracks).
       vec3 sN = length(smoothNormal) > 1e-6 ? normalize(smoothNormal) : safeN;
       pos = position + sN * h * amplitude;
+      // Overhang protection: never move a vertex below its original Z.
+      if (noDownwardZ == 1 && pos.z < position.z) pos.z = position.z;
     }
 
     // Always pass the ORIGINAL position for UV computation in the fragment shader.
@@ -443,6 +450,7 @@ export function updateMaterial(material, displacementTexture, settings) {
   u.seamBandWidth.value           = settings.seamBandWidth           ?? 0.35;
   u.capAngle.value                = settings.capAngle                ?? 20.0;
   u.symmetricDisplacement.value   = settings.symmetricDisplacement   ? 1 : 0;
+  u.noDownwardZ.value             = settings.noDownwardZ             ? 1 : 0;
   u.useDisplacement.value         = settings.useDisplacement         ? 1 : 0;
   u.textureAspect.value.set(settings.textureAspectU ?? 1, settings.textureAspectV ?? 1);
   u.boundaryFalloffDist.value       = settings.boundaryFalloff           ?? 0.0;
@@ -477,6 +485,7 @@ function buildUniforms(tex, settings) {
     seamBandWidth:            { value: settings.seamBandWidth            ?? 0.35 },
     capAngle:                 { value: settings.capAngle                 ?? 20.0 },
     symmetricDisplacement:    { value: settings.symmetricDisplacement   ? 1 : 0 },
+    noDownwardZ:              { value: settings.noDownwardZ             ? 1 : 0 },
     useDisplacement:          { value: settings.useDisplacement         ? 1 : 0 },
     textureAspect:            { value: new THREE.Vector2(settings.textureAspectU ?? 1, settings.textureAspectV ?? 1) },
     boundaryEdgeTex:          { value: createFallbackDataTexture() },

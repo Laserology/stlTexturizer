@@ -14,8 +14,19 @@
 
 import * as THREE from 'three';
 
-const QUANTISE   = 1e4;
-const SAFETY_CAP = 20_000_000; // absolute OOM guard
+// 10 µm vertex-dedup cells. Below 1e5 (= 100 µm) small-fillet meshes have
+// distinct fillet vertices that round to the same key and merge incorrectly,
+// producing zero-length edges and non-manifold artifacts after displacement.
+// 1e5 still tolerates float32 round-trip noise (~1e-4 mm worst case at metre
+// scales) so well-formed inputs continue to dedup cleanly.
+const QUANTISE   = 1e5;
+// Absolute OOM guard.  Beyond this size the pipeline downstream of subdivide
+// (apply-displacement copy, QEM decimation working set, V8 Map limit at
+// ~16M edges) starts OOMing the tab.  16M is empirically the highest value
+// that still completes reliably on typical desktop browsers; the Smart
+// recommender targets a conservative ~4M, but power users dragging the
+// resolution slider manually can push subdivision up to this hard cap.
+const SAFETY_CAP = 16_000_000;
 
 // ── Public entry point ───────────────────────────────────────────────────────
 
@@ -59,7 +70,20 @@ export async function subdivide(geometry, maxEdgeLength, onProgress, faceWeights
       break;
     }
 
-    // Find longest edge for progress reporting
+    const { newIndices, newFaceExcluded, newFaceParentId, changed, capped } = subdividePass(
+      positions, normals, weights, currentIndices, maxEdgeLength, SAFETY_CAP, currentFaceExcluded,
+      canonIdx, posCanonMap, currentFaceParentId
+    );
+    currentIndices = newIndices;
+    if (newFaceExcluded) currentFaceExcluded = newFaceExcluded;
+    if (newFaceParentId) currentFaceParentId = newFaceParentId;
+
+    if (capped || newIndices.length / 3 >= SAFETY_CAP) safetyCapHit = true;
+
+    // Report POST-pass state — the longest edge now is what the pass left
+    // behind, not what it just refined away.  This way the user sees the
+    // edge length actually decrease across iterations instead of seeing
+    // each value one step delayed.
     let maxEdgeLenSq = 0;
     for (let t = 0; t < currentIndices.length; t += 3) {
       const a = currentIndices[t], b = currentIndices[t + 1], c = currentIndices[t + 2];
@@ -71,16 +95,6 @@ export async function subdivide(geometry, maxEdgeLength, onProgress, faceWeights
       if (ca > maxEdgeLenSq) maxEdgeLenSq = ca;
     }
     const longestEdge = Math.sqrt(maxEdgeLenSq);
-
-    const { newIndices, newFaceExcluded, newFaceParentId, changed } = subdividePass(
-      positions, normals, weights, currentIndices, maxEdgeLength, SAFETY_CAP, currentFaceExcluded,
-      canonIdx, posCanonMap, currentFaceParentId
-    );
-    currentIndices = newIndices;
-    if (newFaceExcluded) currentFaceExcluded = newFaceExcluded;
-    if (newFaceParentId) currentFaceParentId = newFaceParentId;
-
-    if (newIndices.length / 3 >= SAFETY_CAP) safetyCapHit = true;
 
     const newTriCount = newIndices.length / 3;
     if (onProgress) onProgress(Math.min(0.95, (iter + 1) / maxIterations), newTriCount, longestEdge);
@@ -137,16 +151,50 @@ function subdividePass(positions, normals, weights, indices, maxEdgeLength, safe
   // interior edges will never be split, saving triangles on untextured
   // regions.  Boundary edges are still marked by the included neighbour, so
   // excluded triangles respond to those splits and T-junctions are avoided.
-  const splitEdges = new Set();
-  for (let t = 0; t < indices.length; t += 3) {
-    if (faceExcluded && faceExcluded[t / 3]) continue; // skip excluded faces
-    const a = indices[t], b = indices[t + 1], c = indices[t + 2];
-    if (edgeLenSq(positions, a, b) > maxSq) splitEdges.add(_edgeKey(a, b));
-    if (edgeLenSq(positions, b, c) > maxSq) splitEdges.add(_edgeKey(b, c));
-    if (edgeLenSq(positions, c, a) > maxSq) splitEdges.add(_edgeKey(c, a));
+  //
+  // The marking Set can hit V8's hash-table cap (~16.7M entries) on very
+  // dense input meshes (~11M+ triangles) where most edges still need to
+  // split.  When that happens treat the pass as cap-aborted: returning
+  // unchanged keeps the mesh watertight (no partial split, no T-junctions).
+  let splitEdges;
+  try {
+    splitEdges = new Set();
+    for (let t = 0; t < indices.length; t += 3) {
+      if (faceExcluded && faceExcluded[t / 3]) continue; // skip excluded faces
+      const a = indices[t], b = indices[t + 1], c = indices[t + 2];
+      if (edgeLenSq(positions, a, b) > maxSq) splitEdges.add(_edgeKey(a, b));
+      if (edgeLenSq(positions, b, c) > maxSq) splitEdges.add(_edgeKey(b, c));
+      if (edgeLenSq(positions, c, a) > maxSq) splitEdges.add(_edgeKey(c, a));
+    }
+  } catch (err) {
+    if (err instanceof RangeError) {
+      return { newIndices: indices, newFaceExcluded: faceExcluded, newFaceParentId: faceParentId, changed: false, capped: true };
+    }
+    throw err;
   }
 
   if (splitEdges.size === 0) return { newIndices: indices, newFaceExcluded: faceExcluded, newFaceParentId: faceParentId, changed: false };
+
+  // ── Step 1.5: predict the post-split triangle count ─────────────────────
+  // Each parent's child count is fully determined by how many of its edges
+  // are marked in splitEdges (0→1, 1→2, 2→3, 3→4).  If the predicted total
+  // exceeds the cap, abort the ENTIRE pass — partially splitting would
+  // leave T-junctions on shared edges (a parent that got split has midpoint
+  // vertices its as-is neighbour doesn't know about), which open into
+  // visible cracks after displacement.
+  let predictedTris = 0;
+  for (let t = 0; t < indices.length; t += 3) {
+    const a = indices[t], b = indices[t + 1], c = indices[t + 2];
+    const sAB = splitEdges.has(_edgeKey(a, b));
+    const sBC = splitEdges.has(_edgeKey(b, c));
+    const sCA = splitEdges.has(_edgeKey(c, a));
+    const n   = (sAB ? 1 : 0) + (sBC ? 1 : 0) + (sCA ? 1 : 0);
+    predictedTris += n === 0 ? 1 : n + 1;   // 0→1, 1→2, 2→3, 3→4
+  }
+  if (predictedTris > safetyCap) {
+    // Coarser-than-requested mesh, but watertight.  Caller flags via `capped`.
+    return { newIndices: indices, newFaceExcluded: faceExcluded, newFaceParentId: faceParentId, changed: false, capped: true };
+  }
 
   // ── Step 2: rebuild index list ───────────────────────────────────────────
   const nextIndices = [];
@@ -154,19 +202,6 @@ function subdividePass(positions, normals, weights, indices, maxEdgeLength, safe
   const nextFaceParentId = faceParentId ? [] : null;
 
   for (let t = 0; t < indices.length; t += 3) {
-    // Safety cap: stop splitting, carry remaining triangles as-is
-    if (nextIndices.length / 3 >= safetyCap) {
-      for (let r = t; r < indices.length; r++) nextIndices.push(indices[r]);
-      // Carry remaining face-exclusion flags as-is
-      if (nextFaceExcluded && faceExcluded) {
-        for (let r = t / 3; r < indices.length / 3; r++) nextFaceExcluded.push(faceExcluded[r]);
-      }
-      if (nextFaceParentId && faceParentId) {
-        for (let r = t / 3; r < indices.length / 3; r++) nextFaceParentId.push(faceParentId[r]);
-      }
-      break;
-    }
-
     const a = indices[t], b = indices[t + 1], c = indices[t + 2];
     const fIdx = t / 3;
     const excl = faceExcluded ? faceExcluded[fIdx] : 0;
@@ -229,6 +264,16 @@ function subdividePass(positions, normals, weights, indices, maxEdgeLength, safe
       // with its two adjacent midpoints; the remaining quadrilateral is
       // split along the diagonal that connects those two midpoints to the
       // opposite vertices, preserving consistent CCW winding throughout.
+      //
+      // KNOWN LIMITATION: on sliver parents (one short edge from CAD
+      // tessellation noise + two long edges), the inner mid-mid diagonal
+      // inherits half the parent's short edge and propagates the sliver
+      // into two new sub-triangles per pass. We can't avoid this — the
+      // alternative pentagon diagonal that would skip the midpoints
+      // necessarily passes through one of them (since each midpoint sits
+      // on its parent edge), producing a degenerate zero-area triangle.
+      // The fix is upstream: clean sub-µm CAD slivers from the input
+      // mesh before texturing.
 
       if (!sAB) {                        // sBC + sCA: fan from C
         const mBC = getMidpoint(positions, normals, weights, midCache, b, c, canonIdx, posCanonMap);

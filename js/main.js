@@ -6,11 +6,14 @@ import { initViewer, loadGeometry, setMeshMaterial, setMeshGeometry, setWirefram
          clearDiagOverlays, setDiagEdges, addDiagFaces,
          setRotationGizmo, isGizmoDragging } from './viewer.js';
 import { loadModelFile, computeBounds, getTriangleCount }  from './stlLoader.js';
+import { computeSmartResolution } from './smartResolution.js';
 import { loadAllThumbnails, loadFullPreset, loadCustomTexture, IMAGE_PRESETS }  from './presetTextures.js';
 import { createPreviewMaterial, updateMaterial } from './previewMaterial.js';
 import { subdivide }          from './subdivision.js';
+import { regularizeMesh }     from './regularize.js';
 import { applyDisplacement }  from './displacement.js';
 import { decimate }           from './decimation.js';
+import { resolveTJunctions, countEdgeDefects, countAreaSlivers } from './meshRepair.js';
 import { exportSTL, export3MF } from './exporter.js';
 import { buildAdjacency, bucketFill,
          buildExclusionOverlayGeo, buildFaceWeights } from './exclusion.js';
@@ -24,10 +27,12 @@ import { zipSync, unzipSync, strToU8, strFromU8 } from 'fflate';
 let currentGeometry   = null;   // original loaded geometry
 let currentBounds     = null;   // bounds of the original geometry
 let currentStlName    = 'model'; // base filename of the loaded STL (no extension)
+let currentStlExt     = '.stl';  // source file extension (.stl/.obj/.3mf), for the stats line
 let activeMapEntry    = null;   // { name, texture, imageData, width, height, isCustom? }
 let _lastCustomMap    = null;   // most recent uploaded/imported custom-map entry, kept across preset switches so the thumbnail can re-activate it
 let previewMaterial   = null;
 let isExporting       = false;
+let isBaking          = false;
 let previewDebounce   = null;
 
 // Boundary edge data texture for per-fragment falloff in bump-only preview
@@ -78,9 +83,18 @@ const settings = {
   mappingBlend:     1,
   seamBandWidth:    0.5,
   textureSmoothing: 0,
+  // Laplacian smoothing iterations applied to the per-vertex blend normal
+  // (only the normal that drives projection-direction blend weights — not
+  // the displacement direction). 0 = off, 4–8 = noticeable seam smoothing,
+  // higher = diminishing returns and risk of losing macro orientation.
+  blendNormalSmoothing: 32,
   capAngle:         20,
   boundaryFalloff:  0,
   symmetricDisplacement: false,
+  noDownwardZ: false,
+  smoothBottom: true,
+  harvestFlatFaces: true,
+  harvestTol: 0.005,
   useDisplacement: false,
   // Cylindrical-mode controls.
   // null/undefined → derive from bounds (preserves legacy / non-cylindrical behavior).
@@ -89,6 +103,19 @@ const settings = {
   cylinderCenterY:  null,
   cylinderRadius:   null,
   cylinderPanelMinimized: false,
+  // Regularize Mesh (Advanced/Beta).  Two-step pipeline applied after the
+  // initial subdivide: collapse sliver chains, then re-subdivide stretched
+  // edges back to a configurable multiple of refineLength.  All knobs here
+  // mirror regularize.js opts; second-pass cap is for the post-regularize
+  // subdivide step in main.js.
+  regularizeEnabled:        true,
+  regularizeAspectThreshold: 5,
+  regularizeSlack:           3.0,
+  regularizeAggressiveSlack: 8.0,
+  regularizeExtremeAspect:   8,
+  regularizeNormalDeg:       15,
+  regularizeAggressiveNormalDeg: 25,
+  regularizeSecondPassMul:   1.1,
 };
 
 // ── Canvas filter support (Safari / iOS WebView don't support ctx.filter) ────
@@ -204,6 +231,15 @@ const customMapRow      = document.getElementById('custom-map-row');
 const customMapSwatch   = document.getElementById('custom-map-swatch');
 const customMapRemoveBtn = document.getElementById('custom-map-remove');
 const meshInfo       = document.getElementById('mesh-info');
+
+// Render the bottom-left mesh stats line, prefixed with the loaded model's
+// name (currentStlName, extension-stripped) so the user can see which file
+// the stats belong to.
+function _setMeshInfo(triCount, mb, sx, sy, sz) {
+  const stats = t('ui.meshInfo', { n: triCount.toLocaleString(), mb, sx, sy, sz });
+  const fileName = currentStlName ? `${currentStlName}${currentStlExt}` : '';
+  meshInfo.textContent = fileName ? `${fileName} · ${stats}` : stats;
+}
 const exportBtn        = document.getElementById('export-btn');
 const export3mfBtn     = document.getElementById('export-3mf-btn');
 const exportProgress   = document.getElementById('export-progress');
@@ -211,6 +247,14 @@ const exportProgBar    = document.getElementById('export-progress-bar');
 const exportProgPct    = document.getElementById('export-progress-pct');
 const exportProgLbl    = document.getElementById('export-progress-label');
 const triLimitWarning  = document.getElementById('tri-limit-warning');
+const bakeBtn          = document.getElementById('bake-btn');
+const bakeMaskChk      = document.getElementById('bake-mask-chk');
+const bakeProgress     = document.getElementById('bake-progress');
+const bakeProgBar      = document.getElementById('bake-progress-bar');
+const bakeProgPct      = document.getElementById('bake-progress-pct');
+const bakeProgLbl      = document.getElementById('bake-progress-label');
+const advancedSection  = document.getElementById('advanced-section');
+const advancedToggle   = document.getElementById('advanced-toggle');
 const wireframeToggle  = document.getElementById('wireframe-toggle');
 const projectionToggle = document.getElementById('projection-toggle');
 const placeOnFaceBtn   = document.getElementById('place-on-face-btn');
@@ -243,6 +287,8 @@ const amplitudeWarning  = document.getElementById('amplitude-warning');
 const invertDisplacementCheckbox = document.getElementById('invert-displacement');
 const refineLenVal = document.getElementById('refine-length-val');
 const resolutionWarning = document.getElementById('resolution-warning');
+const smartResBtn  = document.getElementById('smart-res-btn');
+const smartResInfo = document.getElementById('smart-res-info');
 const maxTriVal    = document.getElementById('max-triangles-val');
 
 const bottomAngleLimitSlider = document.getElementById('bottom-angle-limit');
@@ -270,6 +316,20 @@ const boundaryFalloffSlider    = document.getElementById('boundary-falloff');
 const boundaryFalloffVal       = document.getElementById('boundary-falloff-val');
 const symmetricDispToggle    = document.getElementById('symmetric-displacement');
 const dispPreviewToggle      = document.getElementById('displacement-preview');
+const noDownwardZChk         = document.getElementById('no-downward-z-chk');
+const smoothBottomChk        = document.getElementById('smooth-bottom-chk');
+const harvestFlatChk         = document.getElementById('harvest-flat-chk');
+const harvestTolInput        = document.getElementById('harvest-tol');
+const harvestTolRow          = document.getElementById('harvest-tol-row');
+const regularizeEnabledChk   = document.getElementById('regularize-enabled-chk');
+const regularizeDebugRows    = document.getElementById('regularize-debug-rows');
+const regAspectThresholdEl   = document.getElementById('reg-aspect-threshold');
+const regSlackEl             = document.getElementById('reg-slack');
+const regAggressiveSlackEl   = document.getElementById('reg-aggressive-slack');
+const regExtremeAspectEl     = document.getElementById('reg-extreme-aspect');
+const regNormalDegEl         = document.getElementById('reg-normal-deg');
+const regAggressiveNormalDegEl = document.getElementById('reg-aggressive-normal-deg');
+const regSecondPassMulEl     = document.getElementById('reg-second-pass-mul');
 
 // ── Exclusion panel DOM refs ──────────────────────────────────────────────────
 const exclBrushBtn        = document.getElementById('excl-brush-btn');
@@ -317,7 +377,7 @@ const imprintClose   = document.getElementById('imprint-close');
 // ── Welcome / What's New popup ───────────────────────────────────────────────
 // Bump this date whenever the "What's New" bullets in index.html change to
 // re-show the popup to all returning visitors who previously dismissed it.
-const WELCOME_LAST_UPDATED = '2026-04-25';
+const WELCOME_LAST_UPDATED = '2026-06-09';
 const WELCOME_STORAGE_KEY  = 'stlt-welcome-seen';
 const welcomeLink     = document.getElementById('welcome-link');
 const welcomeOverlay  = document.getElementById('welcome-overlay');
@@ -875,7 +935,7 @@ function populateLanguageSelector() {
       const sx = currentBounds.size.x.toFixed(2);
       const sy = currentBounds.size.y.toFixed(2);
       const sz = currentBounds.size.z.toFixed(2);
-      meshInfo.textContent = t('ui.meshInfo', { n: triCount.toLocaleString(), mb, sx, sy, sz });
+      _setMeshInfo(triCount, mb, sx, sy, sz);
       refreshExclusionOverlay();
       if (lastFastDiag) renderFastDiag(lastFastDiag);
       if (lastAdvancedDiag) renderAdvancedDiag(lastAdvancedDiag);
@@ -1338,7 +1398,15 @@ function wireEvents() {
     updatePreview();
   });
   linkSlider(boundaryFalloffSlider, boundaryFalloffVal, v => { settings.boundaryFalloff = v; _falloffDirty = true; return v.toFixed(1); });
-  linkSlider(refineLenSlider, refineLenVal, v => { settings.refineLength  = v; checkResolutionWarning(); return v.toFixed(2); }, false);
+  linkSlider(refineLenSlider, refineLenVal, v => {
+    settings.refineLength = v;
+    checkResolutionWarning();
+    // Diagnostic from a previous Smart click no longer matches the new value.
+    // (applySmartResolution sets values without dispatching `input`, so this
+    // only fires when the user drags or types — exactly what we want.)
+    if (smartResInfo) smartResInfo.classList.add('hidden');
+    return v.toFixed(2);
+  }, false);
   refineLenVal.addEventListener('change', checkResolutionWarning);
   linkSlider(maxTriSlider, maxTriVal, v => { settings.maxTriangles = v; return formatM(v); }, false);
   linkSlider(bottomAngleLimitSlider, bottomAngleLimitVal, v => { settings.bottomAngleLimit = v; _falloffDirty = true; return v; });
@@ -1351,6 +1419,53 @@ function wireEvents() {
     settings.symmetricDisplacement = symmetricDispToggle.checked;
     updatePreview();
   });
+  noDownwardZChk.addEventListener('change', () => {
+    settings.noDownwardZ = noDownwardZChk.checked;
+    updatePreview();
+  });
+  smoothBottomChk.checked = settings.smoothBottom;
+  smoothBottomChk.addEventListener('change', () => {
+    settings.smoothBottom = smoothBottomChk.checked;
+    // No preview rebuild needed — the snap is a final-export step only.
+  });
+  harvestFlatChk.checked = settings.harvestFlatFaces;
+  harvestTolRow.classList.toggle('disabled', !settings.harvestFlatFaces);
+  harvestFlatChk.addEventListener('change', () => {
+    settings.harvestFlatFaces = harvestFlatChk.checked;
+    harvestTolRow.classList.toggle('disabled', !settings.harvestFlatFaces);
+    // No preview rebuild needed — harvesting only affects the final decimation.
+  });
+  harvestTolInput.value = settings.harvestTol;
+  harvestTolInput.addEventListener('input', () => {
+    const v = parseFloat(harvestTolInput.value);
+    if (Number.isFinite(v) && v >= 0) settings.harvestTol = v;
+    // No preview rebuild needed — harvesting only affects the final decimation.
+  });
+
+  // Regularize (Advanced/Beta) — toggle + 7 debug knobs.  The toggle disables
+  // the entire regularize+resub pipeline; the knobs adjust regularize.js opts.
+  regularizeEnabledChk.checked = settings.regularizeEnabled;
+  regularizeDebugRows.classList.toggle('disabled', !settings.regularizeEnabled);
+  regularizeEnabledChk.addEventListener('change', () => {
+    settings.regularizeEnabled = regularizeEnabledChk.checked;
+    regularizeDebugRows.classList.toggle('disabled', !settings.regularizeEnabled);
+    updatePreview();
+  });
+  // Helper — wire a number input to a settings key, schedule a preview update.
+  const _wireRegNumber = (el, key, parser = parseFloat) => {
+    el.value = settings[key];
+    el.addEventListener('input', () => {
+      const v = parser(el.value);
+      if (Number.isFinite(v)) { settings[key] = v; updatePreview(); }
+    });
+  };
+  _wireRegNumber(regAspectThresholdEl,    'regularizeAspectThreshold');
+  _wireRegNumber(regSlackEl,              'regularizeSlack');
+  _wireRegNumber(regAggressiveSlackEl,    'regularizeAggressiveSlack');
+  _wireRegNumber(regExtremeAspectEl,      'regularizeExtremeAspect');
+  _wireRegNumber(regNormalDegEl,          'regularizeNormalDeg');
+  _wireRegNumber(regAggressiveNormalDegEl,'regularizeAggressiveNormalDeg');
+  _wireRegNumber(regSecondPassMulEl,      'regularizeSecondPassMul');
 
   dispPreviewToggle.addEventListener('change', () => {
     toggleDisplacementPreview(dispPreviewToggle.checked);
@@ -1450,6 +1565,12 @@ function wireEvents() {
   };
   exportBtn.addEventListener('click', () => startExport('stl'));
   export3mfBtn.addEventListener('click', () => startExport('3mf'));
+
+  // ── Advanced / Beta Features panel: collapse toggle + bake action ──
+  advancedToggle.addEventListener('click', () => {
+    advancedSection.classList.toggle('collapsed');
+  });
+  bakeBtn.addEventListener('click', bakeTextures);
 
   // ── Wireframe ──
   wireframeToggle.addEventListener('change', () => setWireframe(wireframeToggle.checked));
@@ -1580,6 +1701,7 @@ function wireEvents() {
       e.preventDefault();
       _lastHoverTriIdx = -1;
       setHoverPreview(null);
+      updateMaskingTriDebug(e);
       const triIdx = pickTriangle(e);
       if (triIdx >= 0) {
         const filled = bucketFill(triIdx, triangleAdjacency, bucketThreshold);
@@ -1605,6 +1727,7 @@ function wireEvents() {
       const triIdx = pickTriangle(e);
       if (triIdx < 0) return;          // miss → let OrbitControls handle the drag
       e.preventDefault();
+      updateMaskingTriDebug(e);
       getControls().enabled = false;
       isPainting = true;
       _lastHoverTriIdx = -1;
@@ -1741,6 +1864,8 @@ function setExclusionTool(tool) {
   if (!exclusionTool) {
     isPainting = false;
     getControls().enabled = true;
+    const dbg = document.getElementById('masking-tri-debug');
+    if (dbg) { dbg.hidden = true; dbg.textContent = ''; }
     // Recompute boundary falloff now that masking is done
     if (_falloffDirty && currentGeometry) {
       const activeGeo = (precisionMaskingEnabled && precisionGeometry)
@@ -1796,6 +1921,47 @@ function pickTriangle(e) {
     fi = precisionParentMap[fi];
   }
   return fi;
+}
+
+// Debug panel: dump vertex coords + edge stats for the *visually picked*
+// triangle on the currently rendered mesh.  Used to investigate sliver chains:
+// pickTriangle() collapses to the original-mesh ancestor (needed by
+// excludedFaces), but for sliver debugging we want the actual subdivided /
+// regularized / preview face that the user clicked on.
+function updateMaskingTriDebug(e) {
+  const el = document.getElementById('masking-tri-debug');
+  if (!el) return;
+  const mesh = getCurrentMesh();
+  if (!mesh) return;
+  _raycaster.setFromCamera(_canvasNDC(e), getCamera());
+  const hits = _raycaster.intersectObject(mesh);
+  const hit = getFrontFaceHit(hits, mesh);
+  if (!hit) return;
+  const fi  = hit.faceIndex;
+  const geo = hit.object.geometry;
+  const pos = geo.attributes.position;
+  // Non-indexed geometry — three corners are at fi*3, fi*3+1, fi*3+2.
+  const ax = pos.getX(fi*3),     ay = pos.getY(fi*3),     az = pos.getZ(fi*3);
+  const bx = pos.getX(fi*3 + 1), by = pos.getY(fi*3 + 1), bz = pos.getZ(fi*3 + 1);
+  const cx = pos.getX(fi*3 + 2), cy = pos.getY(fi*3 + 2), cz = pos.getZ(fi*3 + 2);
+  const lAB = Math.hypot(bx-ax, by-ay, bz-az);
+  const lBC = Math.hypot(cx-bx, cy-by, cz-bz);
+  const lCA = Math.hypot(ax-cx, ay-cy, az-cz);
+  const lmin = Math.min(lAB, lBC, lCA);
+  const lmax = Math.max(lAB, lBC, lCA);
+  const aspect = lmin > 0 ? lmax / lmin : Infinity;
+  const tag = geo === currentGeometry        ? 'orig'
+            : geo === precisionGeometry      ? 'precision'
+            : geo === dispPreviewGeometry    ? 'preview'
+            : 'mesh';
+  el.textContent =
+    `tri #${fi}  (${tag})\n` +
+    `A:  (${ax.toFixed(4)}, ${ay.toFixed(4)}, ${az.toFixed(4)})\n` +
+    `B:  (${bx.toFixed(4)}, ${by.toFixed(4)}, ${bz.toFixed(4)})\n` +
+    `C:  (${cx.toFixed(4)}, ${cy.toFixed(4)}, ${cz.toFixed(4)})\n` +
+    `AB=${lAB.toFixed(4)}  BC=${lBC.toFixed(4)}  CA=${lCA.toFixed(4)}  mm\n` +
+    `min=${lmin.toFixed(4)}  max=${lmax.toFixed(4)}  aspect=${aspect.toFixed(2)}`;
+  el.hidden = false;
 }
 
 /**
@@ -2186,10 +2352,12 @@ function handlePlaceOnFaceClick(e) {
   const sx = currentBounds.size.x.toFixed(2);
   const sy = currentBounds.size.y.toFixed(2);
   const sz = currentBounds.size.z.toFixed(2);
-  meshInfo.textContent = t('ui.meshInfo', { n: triCount.toLocaleString(), mb, sx, sy, sz });
+  _setMeshInfo(triCount, mb, sx, sy, sz);
 
   exportBtn.disabled = (activeMapEntry === null);
   export3mfBtn.disabled = (activeMapEntry === null);
+  bakeBtn.disabled = (activeMapEntry === null);
+  updateSmartResBtnState();
   updatePreview();
 
   // Rebuild exclusion overlay with new vertex positions (face indices unchanged)
@@ -2618,7 +2786,7 @@ function formatM(n) {
 function loadDefaultCube() {
   // Create a 50×50×50 mm box; convert to non-indexed so it behaves like a
   // real STL (buildAdjacency and displacement expect non-indexed geometry).
-  const geo = new THREE.BoxGeometry(50, 50, 50).toNonIndexed();
+  let geo = new THREE.BoxGeometry(50, 50, 50).toNonIndexed();
   geo.computeBoundingBox();
   geo.computeVertexNormals();
 
@@ -2630,6 +2798,7 @@ function loadDefaultCube() {
   currentGeometry = geo;
   currentBounds   = computeBounds(geo);
   currentStlName  = 'cube_50x50x50';
+  currentStlExt   = '.stl';
   checkAmplitudeWarning();
 
   loadGeometry(geo);
@@ -2683,10 +2852,12 @@ function loadDefaultCube() {
   const sx = currentBounds.size.x.toFixed(2);
   const sy = currentBounds.size.y.toFixed(2);
   const sz = currentBounds.size.z.toFixed(2);
-  meshInfo.textContent = t('ui.meshInfo', { n: triCount.toLocaleString(), mb, sx, sy, sz });
+  _setMeshInfo(triCount, mb, sx, sy, sz);
 
   exportBtn.disabled = (activeMapEntry === null);
   export3mfBtn.disabled = (activeMapEntry === null);
+  bakeBtn.disabled = (activeMapEntry === null);
+  updateSmartResBtnState();
   updatePreview();
 }
 
@@ -2704,6 +2875,8 @@ async function handleModelFile(file) {
     currentGeometry = geometry;
     currentBounds   = bounds;
     currentStlName  = file.name.replace(/\.(stl|obj|3mf)$/i, '');
+    const _extMatch = file.name.match(/\.(stl|obj|3mf)$/i);
+    currentStlExt   = _extMatch ? _extMatch[0].toLowerCase() : '';
     checkAmplitudeWarning();
 
     // Log (but don't block the user with an alert) if bad triangles were
@@ -2742,8 +2915,10 @@ async function handleModelFile(file) {
     _cylSilhouetteAnchor = null;
     updateCylinderUIVisibility();
 
-    // Show mesh with a default material until a map is selected
-    loadGeometry(geometry);
+    // Show mesh with a default material until a map is selected.  Use
+    // currentGeometry (not the destructured `geometry`) since the input-clean
+    // pass above may have replaced it with a regularized copy.
+    loadGeometry(currentGeometry);
     dropHint.classList.add('hidden');
 
     // Reset displacement preview for the new mesh
@@ -2795,11 +2970,11 @@ async function handleModelFile(file) {
     exclCount.textContent = t('excl.initExcluded');
     // Build adjacency data for brush/bucket tools (synchronous; fast enough for
     // typical STL sizes processed by this tool)
-    const adjData = buildAdjacency(geometry);
+    const adjData = buildAdjacency(currentGeometry);
     triangleAdjacency = adjData.adjacency;
     triangleCentroids = adjData.centroids;
     triangleFaceNormals = adjData.faceNormals;
-    updateMeshDiagnostics(adjData, geometry.attributes.position.count / 3);
+    updateMeshDiagnostics(adjData, currentGeometry.attributes.position.count / 3);
 
     // Carry scale, offset, rotation, and all other tuning across model swaps —
     // they're normalized to the bounding box so they apply meaningfully to the
@@ -2816,15 +2991,16 @@ async function handleModelFile(file) {
     refineLenVal.value = defaultEdge;
     checkResolutionWarning();
 
-    const triCount = getTriangleCount(geometry);
-    const mb = ((geometry.attributes.position.array.byteLength) / 1024 / 1024).toFixed(2);
+    const triCount = getTriangleCount(currentGeometry);
+    const mb = ((currentGeometry.attributes.position.array.byteLength) / 1024 / 1024).toFixed(2);
     const sx = bounds.size.x.toFixed(2);
     const sy = bounds.size.y.toFixed(2);
     const sz = bounds.size.z.toFixed(2);
-    meshInfo.textContent = t('ui.meshInfo', { n: triCount.toLocaleString(), mb, sx, sy, sz });
+    _setMeshInfo(triCount, mb, sx, sy, sz);
 
     exportBtn.disabled = (activeMapEntry === null);
     export3mfBtn.disabled = (activeMapEntry === null);
+    updateSmartResBtnState();
     updatePreview();
   } catch (err) {
     console.error('Failed to load model:', err);
@@ -3015,6 +3191,62 @@ function checkResolutionWarning() {
   refineLenSlider.classList.toggle('res-warn', tooCoarse);
   refineLenVal.classList.toggle('res-warn', tooCoarse);
 }
+
+/**
+ * Smart resolution: pick a refineLength based on the active texture's detail
+ * and the model's surface area, capped to fit the triangle budget.  Run on
+ * demand (button) so the result reflects the most up-to-date texture, mapping,
+ * and geometry — i.e. the state the export pipeline will actually consume.
+ */
+function applySmartResolution() {
+  if (!currentGeometry || !currentBounds || !activeMapEntry) return;
+  // Use the smoothing-blurred ImageData when textureSmoothing > 0 — that's
+  // the data the export pipeline actually samples, and a heavily blurred
+  // texture has lower gradients → lower PPE → coarser recommended edge.
+  const effective = getEffectiveMapEntry() || activeMapEntry;
+  const result = computeSmartResolution({
+    geometry: currentGeometry,
+    bounds:   currentBounds,
+    settings,
+    texture:  effective,
+  });
+  if (!result) return;
+
+  // Apply both values together.  Resolution and max-tri are a matched pair —
+  // both are derived from the texture / amplitude / surface area, and the
+  // chosen edge assumes decimation will land near `recommendedMaxTri`.
+  // Setting them in lockstep means clicking Smart twice is idempotent.
+  const d = result.diagnostics;
+  settings.refineLength = result.edge;
+  refineLenSlider.value = result.edge;
+  refineLenVal.value    = result.edge;
+  checkResolutionWarning();
+
+  // Set max-tri via the slider's existing input event so settings.maxTriangles
+  // and the displayed label stay consistent with all other slider drag paths.
+  maxTriSlider.value = d.recommendedMaxTri;
+  maxTriSlider.dispatchEvent(new Event('input', { bubbles: true }));
+
+  const maxLabel = formatM(d.recommendedMaxTri);
+  const clampedNote = d.budgetClamped
+    ? ` <span class="clamped">[${t('ui.smartResBudgetCapped')}]</span>`
+    : '';
+  smartResInfo.innerHTML = t('ui.smartResInfo', {
+    edge: result.edge.toFixed(2),
+    ppe:  d.pixelsPerEdge.toFixed(1),
+    pix:  d.pixMm.toFixed(3),
+    area: (d.surfaceArea / 100).toFixed(0),  // cm²
+    tris: maxLabel,
+  }) + clampedNote;
+  smartResInfo.classList.remove('hidden');
+}
+
+function updateSmartResBtnState() {
+  if (!smartResBtn) return;
+  smartResBtn.disabled = !(currentGeometry && activeMapEntry);
+}
+
+if (smartResBtn) smartResBtn.addEventListener('click', applySmartResolution);
 
 /**
  * Set (or update) the `faceMask` vertex attribute on a geometry.
@@ -3595,6 +3827,19 @@ function getEffectiveMapEntry() {
   return _effectiveMapCache;
 }
 
+// Build the regularize.js opts object from current settings.  Centralised so
+// preview / export / bake stay in sync with the Advanced-panel debug knobs.
+function _regularizeOpts() {
+  return {
+    aspectThreshold:           settings.regularizeAspectThreshold,
+    slack:                     settings.regularizeSlack,
+    aggressiveSlack:           settings.regularizeAggressiveSlack,
+    extremeSliverAspect:       settings.regularizeExtremeAspect,
+    maxNormalDeltaCos:         Math.cos(settings.regularizeNormalDeg          * Math.PI / 180),
+    aggressiveNormalDeltaCos:  Math.cos(settings.regularizeAggressiveNormalDeg * Math.PI / 180),
+  };
+}
+
 function updatePreview() {
   if (!currentGeometry || !currentBounds) return;
 
@@ -3620,6 +3865,8 @@ function updatePreview() {
     }
     exportBtn.disabled = true;
     export3mfBtn.disabled = true;
+    bakeBtn.disabled = true;
+    updateSmartResBtnState();
     return;
   }
 
@@ -3645,6 +3892,8 @@ function updatePreview() {
   syncBoundaryEdgeUniforms();
   exportBtn.disabled = false;
   export3mfBtn.disabled = false;
+  bakeBtn.disabled = isBaking;
+  updateSmartResBtnState();
 }
 
 // ── Displacement preview ──────────────────────────────────────────────────────
@@ -3803,7 +4052,7 @@ function deactivatePrecisionMasking() {
     const sx = currentBounds.size.x.toFixed(2);
     const sy = currentBounds.size.y.toFixed(2);
     const sz = currentBounds.size.z.toFixed(2);
-    meshInfo.textContent = t('ui.meshInfo', { n: triCount.toLocaleString(), mb, sx, sy, sz });
+    _setMeshInfo(triCount, mb, sx, sy, sz);
   } else if (precisionExcludedFaces.size > 0 && precisionParentMap) {
     // No precision geometry but have selections — map back to original
     excludedFaces = new Set();
@@ -3918,7 +4167,7 @@ async function refreshPrecisionMesh() {
     const sx = currentBounds.size.x.toFixed(2);
     const sy = currentBounds.size.y.toFixed(2);
     const sz = currentBounds.size.z.toFixed(2);
-    meshInfo.textContent = t('ui.meshInfo', { n: triCount.toLocaleString(), mb, sx, sy, sz });
+    _setMeshInfo(triCount, mb, sx, sy, sz);
 
     if (safetyCapHit) {
       triLimitWarning.classList.remove('hidden');
@@ -4028,16 +4277,66 @@ async function toggleDisplacementPreview(enable) {
     );
     if (dispPreviewToken !== myToken) { subdivided.dispose(); return; }
 
-    addSmoothNormals(subdivided);
-    addFaceNormals(subdivided);
+    // Pipeline: subdivide → regularize → subdivide.  The first subdivide
+    // brings edges down to previewEdge but creates sliver chains from any
+    // CAD-tessellation needles in the input (laserPlate-style fans).  The
+    // regularize collapses those slivers, possibly stretching a few edges
+    // along the way.  The second subdivide brings those stretched edges
+    // back to ≤ previewEdge × secondPassMul for clean displacement sampling.
+    // The whole regularize+resub block can be disabled from the Advanced panel.
+    let activeGeo, activeParents;
+    if (settings.regularizeEnabled) {
+      const regPrev = regularizeMesh(subdivided, faceParentId, previewEdge, _regularizeOpts());
+      subdivided.dispose();
+      if (dispPreviewToken !== myToken) { regPrev.geometry.dispose(); return; }
+
+      // Build per-face exclusion weights for the second subdivide so masked
+      // surfaces don't get refined (they won't be displaced anyway).  Preview's
+      // first subdivide doesn't bake mask into geometry (shader handles it),
+      // so we derive it here from app state mapped through regPrev.faceParentId.
+      let secondPassWeightsPrev = null;
+      if (excludedFaces.size > 0 || selectionMode) {
+        const triCount = regPrev.geometry.attributes.position.count / 3;
+        secondPassWeightsPrev = new Float32Array(triCount * 3);
+        for (let i = 0; i < triCount; i++) {
+          const origFace = regPrev.faceParentId[i];
+          let isExcluded = excludedFaces.has(origFace);
+          if (selectionMode) isExcluded = !isExcluded;
+          if (isExcluded) {
+            secondPassWeightsPrev[i*3]     = 1.0;
+            secondPassWeightsPrev[i*3 + 1] = 1.0;
+            secondPassWeightsPrev[i*3 + 2] = 1.0;
+          }
+        }
+      }
+      const { geometry: resubPrev, faceParentId: resubParentsPrev } = await subdivide(
+        regPrev.geometry, previewEdge * settings.regularizeSecondPassMul, null, secondPassWeightsPrev, { fast: true }
+      );
+      regPrev.geometry.dispose();
+      if (dispPreviewToken !== myToken) { resubPrev.dispose(); return; }
+
+      // Compose parent maps: resubParents → regularize-faces → original-mesh faces.
+      const composedParentsPrev = new Int32Array(resubParentsPrev.length);
+      for (let i = 0; i < resubParentsPrev.length; i++) {
+        composedParentsPrev[i] = regPrev.faceParentId[resubParentsPrev[i]];
+      }
+      activeGeo = resubPrev;
+      activeParents = composedParentsPrev;
+    } else {
+      activeGeo = subdivided;
+      activeParents = faceParentId;
+    }
+
+    addSmoothNormals(activeGeo);
+    addFaceNormals(activeGeo);
 
     // Dispose previous preview geometry if any
     if (dispPreviewGeometry) dispPreviewGeometry.dispose();
-    dispPreviewGeometry = subdivided;
+    dispPreviewGeometry = activeGeo;
 
     // Use the face parent IDs tracked through subdivision (O(n) instead of spatial search)
-    dispPreviewParentMap = faceParentId;
-    updateFaceMask(subdivided);
+    dispPreviewParentMap = activeParents;
+    updateFaceMask(activeGeo);
 
     // Force material recreation so it binds the new geometry with smoothNormal
     if (previewMaterial) {
@@ -4104,7 +4403,7 @@ function buildCombinedFaceWeights(geometry, excludedFaces, invert, settings) {
 }
 
 async function handleExport(format = 'stl') {
-  if (!currentGeometry || !activeMapEntry || isExporting) return;
+  if (!currentGeometry || !activeMapEntry || isExporting || isBaking) return;
   const myToken = ++exportToken;
   isExporting = true;
   exportBtn.classList.add('busy');
@@ -4143,11 +4442,38 @@ async function handleExport(format = 'stl') {
         const label = triCount != null
           ? t('progress.refining', { cur: triCount.toLocaleString(), edge: longestEdge.toFixed(2) })
           : t('progress.subdividing');
-        setProgress(0.02 + p * 0.35, label);
+        setProgress(0.02 + p * 0.28, label);
       },
       faceWeights
     ));
     if (exportToken !== myToken) return;
+
+    // Regularize sub-slivers, then re-subdivide stretched edges — see preview
+    // pipeline for rationale.  Skipped entirely when the Advanced toggle is
+    // off.  Faceweight mapping isn't propagated through regularize on this
+    // branch because user-painted exclusions were already baked into the
+    // first subdivide via faceWeights → excludeWeight, which regularize then
+    // copies through and we can pass straight to the second subdivide.
+    if (settings.regularizeEnabled) {
+      setProgress(0.30, t('progress.regularizing'));
+      await yieldFrame();
+      const reg = regularizeMesh(subdivided, new Int32Array(subdivided.attributes.position.count / 3), settings.refineLength, _regularizeOpts());
+      subdivided.dispose();
+      const exclAttr = reg.geometry.attributes.excludeWeight;
+      const secondPassWeights = exclAttr ? exclAttr.array : null;
+      const { geometry: resub } = await subdivide(
+        reg.geometry, settings.refineLength * settings.regularizeSecondPassMul,
+        (p, triCount, longestEdge) => {
+          const label = triCount != null
+            ? t('progress.refining', { cur: triCount.toLocaleString(), edge: longestEdge.toFixed(2) })
+            : t('progress.subdividing');
+          setProgress(0.32 + p * 0.06, label);
+        },
+        secondPassWeights, { fast: false }
+      );
+      reg.geometry.dispose();
+      subdivided = resub;
+    }
 
     const subTriCount = subdivided.attributes.position.count / 3;
     setProgress(0.38, t('progress.applyingDisplacement', { n: subTriCount.toLocaleString() }));
@@ -4175,19 +4501,31 @@ async function handleExport(format = 'stl') {
     triLimitWarning.textContent = t('warnings.safetyCapHit');
 
     finalGeometry = displaced;
-    if (needsDecimation) {
-      setProgress(0.71, t('progress.decimatingTo', { from: dispTriCount.toLocaleString(), to: settings.maxTriangles.toLocaleString() }));
+    // Run when over the target (true decimation) OR when only flat-face
+    // harvesting is needed — harvesting collapses free flat faces even when the
+    // mesh is already under the Output-Triangles limit.
+    const runDecimation = needsDecimation || settings.harvestFlatFaces;
+    if (runDecimation) {
+      setProgress(0.71, needsDecimation
+        ? t('progress.decimatingTo', { from: dispTriCount.toLocaleString(), to: settings.maxTriangles.toLocaleString() })
+        : t('progress.harvestingFlat'));
       finalGeometry = await runAsync(() =>
         decimate(
           displaced,
           settings.maxTriangles,
           (p) => {
-            const cur = Math.round(dispTriCount - (dispTriCount - settings.maxTriangles) * p);
-            setProgress(
-              0.71 + p * 0.25,
-              t('progress.decimating', { cur: cur.toLocaleString(), to: settings.maxTriangles.toLocaleString() })
-            );
-          }
+            if (needsDecimation) {
+              const cur = Math.round(dispTriCount - (dispTriCount - settings.maxTriangles) * p);
+              setProgress(
+                0.71 + p * 0.25,
+                t('progress.decimating', { cur: cur.toLocaleString(), to: settings.maxTriangles.toLocaleString() })
+              );
+            } else {
+              setProgress(0.71 + p * 0.25, t('progress.harvestingFlat'));
+            }
+          },
+          settings.harvestFlatFaces,
+          settings.harvestTol
         )
       );
       // Free pre-decimation geometry — decimate created a separate copy
@@ -4223,6 +4561,46 @@ async function handleExport(format = 'stl') {
       finalGeometry.attributes.position.needsUpdate = true;
       if (!finalGeometry.attributes.normal) finalGeometry.setAttribute('normal', new THREE.Float32BufferAttribute(na, 3));
       else finalGeometry.attributes.normal.needsUpdate = true;
+    }
+
+    // Smooth Bottom: snap any vertex within 0.1 mm of the bottom plane onto
+    // it so the bed-contact surface is perfectly flat. Catches the residual
+    // height drift on bottom slivers that the in-displacement clamp can't
+    // touch (e.g. fillet vertices a few µm above bottomZ that get tilted
+    // by texture sampling). Runs after the bottomAngleLimit clamp so the
+    // two complement each other when both are active.
+    if (settings.smoothBottom) {
+      snapBottomToFlat(finalGeometry, currentBounds.min.z, 0.1);
+    }
+
+    // Resolve T-junctions so the export is watertight & manifold. Decimation (and
+    // the bottom snaps above) can leave a long edge meeting several short ones
+    // across split seams — open edges that no weld tolerance can fix. This splits
+    // those long edges at the on-edge vertices, restoring shared topology. Only
+    // run on the decimated (sparse) mesh — welding the dense pre-decimation mesh
+    // at the export grid would instead collapse its fine detail into degenerates.
+    if (runDecimation) {
+      setProgress(0.96, t('progress.repairingMesh'));
+      await yieldFrame();
+      const beforeSlivers = countAreaSlivers(finalGeometry);
+      const repaired = resolveTJunctions(finalGeometry);
+      finalGeometry.dispose();
+      finalGeometry = repaired;
+      const after = countEdgeDefects(finalGeometry);
+      const afterSlivers = countAreaSlivers(finalGeometry);
+      // Ground-truth readout from the live browser. The decisive number is
+      // `afterSlivers`: zero-area "needle" triangles read as watertight here but
+      // every slicer (and our own importer) deletes them, punching a hole at each
+      // — that was the real cause of the open-edge warning on re-imported files.
+      // After repair both `afterSlivers` and `after.open` must be 0.
+      console.log(
+        `%c[stlTexturizer] mesh repair (build 2026-06-09c): ` +
+        `removed ${beforeSlivers.toLocaleString()} zero-area slivers; ` +
+        `final open=${after.open}, non-manifold=${after.nonManifold}, slivers=${afterSlivers} ` +
+        `(${after.tris.toLocaleString()} tris)`,
+        'color:#0a0;font-weight:bold'
+      );
+      if (exportToken !== myToken) return;
     }
 
     const texLabel = activeMapEntry.isCustom ? 'custom' : activeMapEntry.name.replace(/\s+/g, '-');
@@ -4275,6 +4653,370 @@ function setProgress(fraction, label) {
   exportProgLbl.textContent = label;
 }
 
+// ── Smooth Bottom (advanced feature) ────────────────────────────────────────
+// Snaps every vertex within `tol` of the bottom plane onto it, so the bed-
+// contact surface comes out perfectly flat regardless of any tiny per-vertex
+// height drift introduced by sliver triangles, displacement noise, or
+// near-horizontal smooth normals tilting the bottom face during texturing.
+// Recomputes face normals on triangles whose vertices moved so slicers shade
+// the now-planar surface uniformly.
+//
+// Threshold default 0.1 mm is well above float-precision noise but below
+// any printer's resolution, so legitimate above-bottom geometry (side
+// fillets, the rest of the model) is left alone. Caller passes `bottomZ`
+// explicitly so this function works on any geometry / coordinate system.
+function snapBottomToFlat(geometry, bottomZ, tol = 0.1) {
+  const pa = geometry.attributes.position.array;
+  const na = geometry.attributes.normal
+    ? geometry.attributes.normal.array
+    : new Float32Array(pa.length);
+  let dirtyTris = 0;
+
+  for (let i = 0; i < pa.length; i += 9) {
+    let dirty = false;
+    if (Math.abs(pa[i+2] - bottomZ) <= tol) { pa[i+2] = bottomZ; dirty = true; }
+    if (Math.abs(pa[i+5] - bottomZ) <= tol) { pa[i+5] = bottomZ; dirty = true; }
+    if (Math.abs(pa[i+8] - bottomZ) <= tol) { pa[i+8] = bottomZ; dirty = true; }
+    if (dirty) {
+      dirtyTris++;
+      const ux = pa[i+3]-pa[i],   uy = pa[i+4]-pa[i+1], uz = pa[i+5]-pa[i+2];
+      const vx = pa[i+6]-pa[i],   vy = pa[i+7]-pa[i+1], vz = pa[i+8]-pa[i+2];
+      const nx = uy*vz-uz*vy, ny = uz*vx-ux*vz, nz = ux*vy-uy*vx;
+      const len = Math.sqrt(nx*nx+ny*ny+nz*nz) || 1;
+      na[i]   = na[i+3] = na[i+6] = nx/len;
+      na[i+1] = na[i+4] = na[i+7] = ny/len;
+      na[i+2] = na[i+5] = na[i+8] = nz/len;
+    }
+  }
+
+  if (dirtyTris > 0) {
+    geometry.attributes.position.needsUpdate = true;
+    if (!geometry.attributes.normal) {
+      geometry.setAttribute('normal', new THREE.Float32BufferAttribute(na, 3));
+    } else {
+      geometry.attributes.normal.needsUpdate = true;
+    }
+  }
+  return dirtyTris;
+}
+
+function setBakeProgress(fraction, label) {
+  const pct = Math.round(fraction * 100);
+  bakeProgBar.style.width = `${pct}%`;
+  bakeProgPct.textContent = `${pct}%`;
+  bakeProgLbl.textContent = label;
+}
+
+// ── Bake Textures (beta) ─────────────────────────────────────────────────────
+// Apply the current displacement texture to currentGeometry and adopt the
+// result as the working model so the user can keep editing on the textured
+// mesh. By default, masks the just-baked faces in the new exclusion set.
+//
+// Pipeline: subdivide → applyDisplacement → (optional) flat-bottom clamp.
+// Decimation is intentionally skipped — decimate() drops the per-face parent
+// mapping needed to translate "which input faces were textured" into the new
+// mesh's triangle indices. Final decimation still happens on Export.
+async function bakeTextures() {
+  if (!currentGeometry || !activeMapEntry || isBaking || isExporting) return;
+  isBaking = true;
+  bakeBtn.classList.add('busy');
+  bakeBtn.disabled = true;
+  bakeProgress.classList.remove('hidden');
+
+  if (precisionMaskingEnabled) deactivatePrecisionMasking();
+
+  let subdivided = null;
+  let displaced  = null;
+  let succeeded  = false;
+
+  try {
+    setBakeProgress(0.02, t('progress.subdividing'));
+    await yieldFrame();
+
+    // Mirror handleExport's pre-flight: combine user mask + angle masking
+    // into per-vertex weights for subdivision.
+    const hasAngleMask = settings.bottomAngleLimit > 0 || settings.topAngleLimit > 0;
+    const faceWeights = (excludedFaces.size > 0 || selectionMode || hasAngleMask)
+      ? buildCombinedFaceWeights(currentGeometry, excludedFaces, selectionMode, settings)
+      : null;
+
+    let faceParentId;
+    ({ geometry: subdivided, faceParentId } = await subdivide(
+      currentGeometry, settings.refineLength,
+      (p, triCount, longestEdge) => {
+        const label = triCount != null
+          ? t('progress.refining', { cur: triCount.toLocaleString(), edge: longestEdge.toFixed(2) })
+          : t('progress.subdividing');
+        setBakeProgress(0.02 + p * 0.34, label);
+      },
+      faceWeights
+    ));
+
+    // Regularize sub-slivers, then re-subdivide stretched edges — see preview
+    // pipeline for rationale.  Skipped entirely when the Advanced toggle is
+    // off.  Compose the two parent maps so faceParentId still points at
+    // original-mesh faces (used below to remap user exclusions onto baked output).
+    if (settings.regularizeEnabled) {
+      setBakeProgress(0.36, t('progress.regularizing'));
+      await yieldFrame();
+      const reg = regularizeMesh(subdivided, faceParentId, settings.refineLength, _regularizeOpts());
+      subdivided.dispose();
+      const exclAttr = reg.geometry.attributes.excludeWeight;
+      const secondPassWeights = exclAttr ? exclAttr.array : null;
+      const { geometry: resub, faceParentId: resubParents } = await subdivide(
+        reg.geometry, settings.refineLength * settings.regularizeSecondPassMul,
+        (p, triCount, longestEdge) => {
+          const label = triCount != null
+            ? t('progress.refining', { cur: triCount.toLocaleString(), edge: longestEdge.toFixed(2) })
+            : t('progress.subdividing');
+          setBakeProgress(0.38 + p * 0.09, label);
+        },
+        secondPassWeights, { fast: false }
+      );
+      reg.geometry.dispose();
+      const composed = new Int32Array(resubParents.length);
+      for (let i = 0; i < resubParents.length; i++) {
+        composed[i] = reg.faceParentId[resubParents[i]];
+      }
+      subdivided = resub;
+      faceParentId = composed;
+    }
+
+    const subTriCount = subdivided.attributes.position.count / 3;
+    setBakeProgress(0.47, t('progress.applyingDisplacement', { n: subTriCount.toLocaleString() }));
+
+    const exportEntry = getEffectiveMapEntry();
+    displaced = await runAsync(() =>
+      applyDisplacement(
+        subdivided,
+        exportEntry.imageData,
+        exportEntry.width,
+        exportEntry.height,
+        settings,
+        currentBounds,
+        (p) => setBakeProgress(0.47 + p * 0.40, t('progress.displacingVertices'))
+      )
+    );
+
+    // Free pre-displacement subdivision — applyDisplacement returns a separate copy.
+    subdivided.dispose();
+    subdivided = null;
+
+    // Mirror the export-side flat-bottom clamp.
+    if (settings.bottomAngleLimit > 0) {
+      const bottomZ = currentBounds.min.z;
+      const pa = displaced.attributes.position.array;
+      const na = displaced.attributes.normal ? displaced.attributes.normal.array : new Float32Array(pa.length);
+
+      for (let i = 0; i < pa.length; i += 9) {
+        let dirty = false;
+        if (pa[i+2] < bottomZ) { pa[i+2] = bottomZ; dirty = true; }
+        if (pa[i+5] < bottomZ) { pa[i+5] = bottomZ; dirty = true; }
+        if (pa[i+8] < bottomZ) { pa[i+8] = bottomZ; dirty = true; }
+
+        if (dirty) {
+          const ux = pa[i+3]-pa[i],   uy = pa[i+4]-pa[i+1], uz = pa[i+5]-pa[i+2];
+          const vx = pa[i+6]-pa[i],   vy = pa[i+7]-pa[i+1], vz = pa[i+8]-pa[i+2];
+          const nx = uy*vz-uz*vy, ny = uz*vx-ux*vz, nz = ux*vy-uy*vx;
+          const len = Math.sqrt(nx*nx+ny*ny+nz*nz) || 1;
+          na[i]   = na[i+3] = na[i+6] = nx/len;
+          na[i+1] = na[i+4] = na[i+7] = ny/len;
+          na[i+2] = na[i+5] = na[i+8] = nz/len;
+        }
+      }
+
+      displaced.attributes.position.needsUpdate = true;
+      if (!displaced.attributes.normal) displaced.setAttribute('normal', new THREE.Float32BufferAttribute(na, 3));
+      else displaced.attributes.normal.needsUpdate = true;
+    }
+
+    // Smooth Bottom — same post-process as the export pipeline so a baked
+    // model and an exported one have an identical bed-contact surface.
+    if (settings.smoothBottom) {
+      snapBottomToFlat(displaced, currentBounds.min.z, 0.1);
+    }
+
+    setBakeProgress(0.90, t('progress.finalizing'));
+    await yieldFrame();
+
+    // Build the new exclusion set: every output triangle whose parent face
+    // was NOT excluded (by user paint, selectionMode, or angle masking) got
+    // textured this round → mask it on the new mesh so a follow-up texture
+    // pass won't double-up. faceWeights[parentIdx*3] > 0.99 captures all
+    // three exclusion paths in a single check (it's the same predicate
+    // subdivide uses to skip subdividing those faces).
+    let preExcluded = null;
+    if (bakeMaskChk.checked) {
+      preExcluded = [];
+      const wasParentExcluded = faceWeights
+        ? (parentIdx) => faceWeights[parentIdx * 3] > 0.99
+        : () => false; // no exclusions at all → every face was textured
+      for (let i = 0; i < faceParentId.length; i++) {
+        if (!wasParentExcluded(faceParentId[i])) preExcluded.push(i);
+      }
+    }
+
+    // Compute new bounds from the displaced geometry. Do NOT re-center —
+    // the displaced mesh is approximately at the same location, and
+    // re-centering would shift the user's frame of reference.
+    displaced.computeBoundingBox();
+    const bb = displaced.boundingBox;
+    const newBounds = {
+      min:    bb.min.clone(),
+      max:    bb.max.clone(),
+      size:   new THREE.Vector3().subVectors(bb.max, bb.min),
+      center: new THREE.Vector3().addVectors(bb.min, bb.max).multiplyScalar(0.5),
+    };
+
+    adoptBakedGeometry(displaced, newBounds, { preExcludedFaces: preExcluded });
+    displaced = null; // ownership transferred to currentGeometry
+
+    succeeded = true;
+    setBakeProgress(1.0, t('progress.done'));
+    setTimeout(() => { bakeProgress.classList.add('hidden'); setBakeProgress(0, ''); }, 1200);
+  } catch (err) {
+    console.error('Bake failed:', err);
+    if (/maximum size|out of memory|alloc/i.test(err.message)) {
+      alert(t('alerts.exportOOM'));
+    } else {
+      alert(t('alerts.bakeFailed', { msg: err.message }));
+    }
+  } finally {
+    if (subdivided) subdivided.dispose();
+    if (displaced)  displaced.dispose();
+    if (!succeeded) bakeProgress.classList.add('hidden');
+    isBaking = false;
+    bakeBtn.classList.remove('busy');
+    bakeBtn.disabled = (activeMapEntry === null);
+  }
+}
+
+// Replace currentGeometry with `geometry` and reset per-model state without
+// touching the user's texture/settings. Mirrors the relevant subset of
+// handleModelFile but keeps activeMapEntry, settings, and refineLength as-is,
+// and seeds excludedFaces from opts.preExcludedFaces.
+function adoptBakedGeometry(geometry, bounds, opts = {}) {
+  // Invalidate any in-flight async operations tied to the previous mesh.
+  precisionToken++;
+  dispPreviewToken++;
+  exportToken++;
+  diagToken++;
+
+  // Dispose the previous working geometry so we don't leak GPU buffers. Note
+  // that it's still referenced by previewMaterial/loadGeometry until we swap
+  // those — but loadGeometry below replaces the visible mesh, and Three's
+  // BufferGeometry.dispose() only frees GPU resources (CPU arrays remain
+  // valid for any code that still holds the reference).
+  if (currentGeometry && currentGeometry !== geometry) currentGeometry.dispose();
+
+  currentGeometry = geometry;
+  currentBounds   = bounds;
+  currentStlName  = `${currentStlName}_baked`;
+  checkAmplitudeWarning();
+
+  geometry = currentGeometry;
+
+  // Dispose preview material so updatePreview rebuilds it on the new mesh.
+  if (previewMaterial) {
+    previewMaterial.dispose();
+    previewMaterial = null;
+  }
+
+  // Replace the visible mesh in the viewer.
+  loadGeometry(geometry);
+
+  // Reset displacement preview — its geometry referenced the pre-bake mesh.
+  if (dispPreviewGeometry) { dispPreviewGeometry.dispose(); dispPreviewGeometry = null; }
+  settings.useDisplacement = false;
+  dispPreviewToggle.checked = false;
+
+  // Reset precision masking — its mesh referenced the pre-bake mesh.
+  if (precisionGeometry) { precisionGeometry.dispose(); precisionGeometry = null; }
+  precisionParentMap  = null;
+  precisionEdgeLength = null;
+  precisionCentroids  = null;
+  precisionFaceNormals = null;
+  precisionAdjacency  = null;
+  precisionMaskingEnabled = false;
+  precisionMaskingToggle.checked = false;
+  precisionStatus.textContent = '';
+  precisionOutdated.classList.add('hidden');
+  precisionRefreshBtn.classList.add('hidden');
+  precisionWarning.classList.add('hidden');
+  precisionMaskingRow.classList.add('hidden');
+
+  // Reset mesh diagnostics — they referenced the pre-bake mesh.
+  meshDiagnostics.classList.add('hidden');
+  meshDiagAdvanced.classList.add('hidden');
+  lastFastDiag = null;
+  lastAdvancedDiag = null;
+  clearDiagHighlight();
+
+  // The seeded mask carries exclude-mode semantics ("don't re-texture these
+  // faces"). If the user was in include-only mode pre-bake, that mode would
+  // invert the meaning to "only texture these faces" — exactly backwards. So
+  // force exclude mode before seeding. setSelectionMode also clears
+  // excludedFaces as a side effect, which is fine — we re-seed below.
+  if (selectionMode) setSelectionMode(false);
+
+  // Seed exclusion mask, exit any active painting/place/rotate modes.
+  excludedFaces = new Set(opts.preExcludedFaces || []);
+  precisionExcludedFaces = new Set();
+  exclusionTool = null;
+  eraseMode     = false;
+  isPainting    = false;
+  if (placeOnFaceActive) togglePlaceOnFace(false);
+  if (rotateActive) toggleRotateMode(false);
+  rotateAngles = { x: 0, y: 0, z: 0 };
+  rotateXInput.value = '0'; rotateYInput.value = '0'; rotateZInput.value = '0';
+  exclBrushBtn.classList.remove('active');
+  exclBucketBtn.classList.remove('active');
+  exclBrushTypeRow.classList.add('hidden');
+  exclRadiusRow.classList.add('hidden');
+  exclThresholdRow.classList.add('hidden');
+  canvas.style.cursor = '';
+  setHoverPreview(null);
+  _lastHoverTriIdx = -1;
+
+  // Build adjacency for the new geometry (needed by brush/bucket tools and
+  // by the exclusion overlay).
+  const adjData = buildAdjacency(geometry);
+  triangleAdjacency = adjData.adjacency;
+  triangleCentroids = adjData.centroids;
+  triangleFaceNormals = adjData.faceNormals;
+  updateMeshDiagnostics(adjData, geometry.attributes.position.count / 3);
+
+  // Refresh exclusion overlay using the new geometry + new mask.
+  if (excludedFaces.size > 0) refreshExclusionOverlay();
+  else setExclusionOverlay(null);
+  const maskCount = excludedFaces.size;
+  exclCount.textContent = maskCount === 0
+    ? t('excl.initExcluded')
+    : (maskCount === 1
+      ? (selectionMode ? t('excl.faceSelected', { n: 1 }) : t('excl.faceExcluded', { n: 1 }))
+      : (selectionMode ? t('excl.facesSelected', { n: maskCount }) : t('excl.facesExcluded', { n: maskCount })));
+
+  // Update mesh info display.
+  triLimitWarning.classList.add('hidden');
+  const triCount = getTriangleCount(geometry);
+  const mb = ((geometry.attributes.position.array.byteLength) / 1024 / 1024).toFixed(2);
+  const sx = bounds.size.x.toFixed(2);
+  const sy = bounds.size.y.toFixed(2);
+  const sz = bounds.size.z.toFixed(2);
+  _setMeshInfo(triCount, mb, sx, sy, sz);
+
+  exportBtn.disabled = (activeMapEntry === null);
+  export3mfBtn.disabled = (activeMapEntry === null);
+  bakeBtn.disabled = (activeMapEntry === null);
+  updateSmartResBtnState();
+
+  updatePreview();
+
+  // Bake is a destructive transform — undo history references the pre-bake
+  // triangle set, so it's no longer meaningful.
+  _clearUndoStacks();
+}
+
 /**
  * Yield to the browser event loop, then run fn.
  * Uses setTimeout instead of rAF so it fires even in background tabs.
@@ -4310,7 +5052,7 @@ const PERSISTED_KEYS = [
   'mappingMode', 'scaleU', 'scaleV', 'lockScale',
   'offsetU', 'offsetV', 'rotation',
   'amplitude', 'textureHeight', 'invertDisplacement',
-  'symmetricDisplacement', 'textureSmoothing',
+  'symmetricDisplacement', 'noDownwardZ', 'smoothBottom', 'harvestFlatFaces', 'harvestTol', 'textureSmoothing',
   'mappingBlend', 'seamBandWidth', 'capAngle', 'boundaryFalloff',
   'bottomAngleLimit', 'topAngleLimit',
   'refineLength', 'maxTriangles',
@@ -4401,6 +5143,22 @@ function applySettingsSnapshot(snap) {
     symmetricDispToggle.checked = snap.symmetricDisplacement;
     symmetricDispToggle.dispatchEvent(new Event('change', { bubbles: true }));
   }
+  if (snap.noDownwardZ != null) {
+    noDownwardZChk.checked = snap.noDownwardZ;
+    noDownwardZChk.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+  if (snap.smoothBottom != null) {
+    smoothBottomChk.checked = snap.smoothBottom;
+    smoothBottomChk.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+  if (snap.harvestFlatFaces != null) {
+    harvestFlatChk.checked = snap.harvestFlatFaces;
+    harvestFlatChk.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+  if (snap.harvestTol != null) {
+    harvestTolInput.value = snap.harvestTol;
+    harvestTolInput.dispatchEvent(new Event('input', { bubbles: true }));
+  }
 
   // Cylindrical-mode state. cylinderCenterX/Y/radius pass through unchanged
   // (null is meaningful — falls back to AABB defaults during projection).
@@ -4480,7 +5238,7 @@ const DEFAULT_SETTINGS_SNAPSHOT = Object.freeze({
   mappingMode: 5, scaleU: 0.5, scaleV: 0.5, lockScale: true,
   offsetU: 0, offsetV: 0, rotation: 0,
   amplitude: 0.5, textureHeight: 0.5, invertDisplacement: false,
-  symmetricDisplacement: false, textureSmoothing: 0,
+  symmetricDisplacement: false, noDownwardZ: false, smoothBottom: true, harvestFlatFaces: true, harvestTol: 0.005, textureSmoothing: 0,
   mappingBlend: 1, seamBandWidth: 0.5, capAngle: 20, boundaryFalloff: 0,
   bottomAngleLimit: 5, topAngleLimit: 0,
   refineLength: 1, maxTriangles: 750000,
@@ -4554,6 +5312,10 @@ const exportModelChk    = document.getElementById('export-model-chk');
 const exportTextureChk  = document.getElementById('export-texture-chk');
 const exportTextureRow  = document.getElementById('export-texture-row');
 const importProjectInput = document.getElementById('import-project-input');
+const loadDialog        = document.getElementById('load-dialog');
+const loadModeAllRadio  = document.getElementById('load-mode-all');
+const loadModeSettingsRadio = document.getElementById('load-mode-settings');
+const loadGoBtn         = document.getElementById('load-go-btn');
 
 exportProjectBtn.addEventListener('click', (e) => {
   e.stopPropagation();
@@ -4716,36 +5478,92 @@ async function importProject(file) {
   if (file.size > PROJECT_MAX_IMPORT) {
     throw new Error(`File too large (${(file.size / 1024 / 1024).toFixed(1)} MB, max 500 MB)`);
   }
-  _undoApplyDepth++;
-  try {
   const buf = await file.arrayBuffer();
-  const unzipped = unzipSync(new Uint8Array(buf));
+  const bytes = new Uint8Array(buf);
+
+  // A .bumpmesh project is a ZIP (PK\x03\x04). If the user picked a bare model
+  // file here instead — common on macOS Chrome, where the accept=".bumpmesh"
+  // filter doesn't reliably hide .stl/.obj files — route it to the model loader
+  // rather than failing with a cryptic "invalid zip data". A 3MF is also a ZIP,
+  // so trust the extension first and fall back to the magic-byte sniff for
+  // extension-less STLs.
+  const isModelExt = /\.(stl|obj|3mf)$/i.test(file.name);
+  const isZip = bytes[0] === 0x50 && bytes[1] === 0x4B &&
+                bytes[2] === 0x03 && bytes[3] === 0x04;
+  if (isModelExt || !isZip) {
+    await handleModelFile(file);
+    return;
+  }
+
+  const unzipped = unzipSync(bytes);
 
   const settingsBytes = unzipped['settings.json'];
   const data = settingsBytes ? JSON.parse(strFromU8(settingsBytes)) : null;
-
-  // 1) Load model first — handleModelFile resets scaleU/scaleV/offsets/refineLength
-  //    AND clears any existing paint mask, so applied settings + restored mask
-  //    below will correctly override those resets.
   const hasModel = !!unzipped['model.stl'];
+
+  // Decide what to load. When the file carries a model the user chooses whether
+  // to replace their current model ('all') or keep it and apply settings only
+  // ('settings'). A file without a model is always settings-only — nothing to
+  // ask. The prompt runs BEFORE we touch any state, so dismissing it is a no-op.
+  let loadMode = 'settings';
   if (hasModel) {
-    const stlFile = new File([unzipped['model.stl']], 'model.stl', { type: 'application/octet-stream' });
-    await handleModelFile(stlFile);
+    const choice = await promptLoadMode();
+    if (choice === null) return; // dialog dismissed → load nothing
+    loadMode = choice;
   }
 
-  // 2) Apply settings after any model reset.
-  if (data) applySettingsSnapshot(data);
+  // Flush any pending settings change so it lands as its own undo step, keeping
+  // the pre-load baseline accurate for the settings-only commit below.
+  _flushUndoCapture();
 
-  // 2b) Restore paint mask — only meaningful when the project shipped a model,
-  //     since indices reference that exact triangle set.
-  if (hasModel && unzipped['mask.json']) {
-    try {
-      const mask = JSON.parse(strFromU8(unzipped['mask.json']));
-      _restoreMask(mask);
-    } catch (err) { console.warn('Could not restore paint mask:', err); }
+  _undoApplyDepth++;
+  try {
+    if (loadMode === 'all') {
+      // Load model first — handleModelFile resets scaleU/scaleV/offsets/refineLength
+      // AND clears any existing paint mask, so applied settings + restored mask
+      // below will correctly override those resets.
+      const stlFile = new File([unzipped['model.stl']], 'model.stl', { type: 'application/octet-stream' });
+      await handleModelFile(stlFile);
+
+      // Apply settings after the model reset.
+      if (data) applySettingsSnapshot(data);
+
+      // Restore paint mask — only meaningful here, since its indices reference
+      // the model we just loaded.
+      if (unzipped['mask.json']) {
+        try {
+          const mask = JSON.parse(strFromU8(unzipped['mask.json']));
+          _restoreMask(mask);
+        } catch (err) { console.warn('Could not restore paint mask:', err); }
+      }
+    } else {
+      // Settings only: keep the current model and its mask untouched. We skip
+      // model.stl (and never call handleModelFile, so the scale/offset/refine
+      // resets don't fire) and mask.json (its indices belong to the saved
+      // model, not the live one).
+      if (data) applySettingsSnapshot(data);
+    }
+
+    await _applyImportedTexture(unzipped, data);
+
+    _autoSaveSettings();
+  } finally {
+    _undoApplyDepth--;
+    if (loadMode === 'all') {
+      // Full import = fresh start; mask indices belong to the imported model.
+      _clearUndoStacks();
+    } else {
+      // Settings-only is an undoable settings change on the unchanged model.
+      _commitUndoCapture();
+    }
   }
+}
 
-  // 3) Texture: custom PNG wins over named preset.
+/**
+ * Apply a project's texture: custom PNG wins over a named preset. Shared by
+ * both load modes — the displacement map is part of the saved settings.
+ */
+async function _applyImportedTexture(unzipped, data) {
   if (unzipped['texture.png']) {
     const texName = (data && data.activeMapName) || 'imported-texture.png';
     const texFile = new File([unzipped['texture.png']], texName, { type: 'image/png' });
@@ -4761,13 +5579,43 @@ async function importProject(file) {
   } else if (data && data.activeMapName) {
     _selectPresetByName(data.activeMapName);
   }
+}
 
-  _autoSaveSettings();
-  } finally {
-    _undoApplyDepth--;
-    // Imported project = fresh start; mask indices belong to the imported model.
-    _clearUndoStacks();
-  }
+/**
+ * Show the load-mode dialog and resolve to 'all' (model + settings),
+ * 'settings' (settings only), or null if the user dismisses it. Defaults to
+ * 'settings' when a model is already loaded (protect what you're working on),
+ * otherwise 'all' (you need the file's model to see anything).
+ */
+function promptLoadMode() {
+  return new Promise((resolve) => {
+    const keepCurrent = !!currentGeometry;
+    loadModeSettingsRadio.checked = keepCurrent;
+    loadModeAllRadio.checked = !keepCurrent;
+    loadDialog.classList.remove('hidden');
+
+    let done = false;
+    const finish = (result) => {
+      if (done) return;
+      done = true;
+      loadDialog.classList.add('hidden');
+      loadGoBtn.removeEventListener('click', onGo);
+      document.removeEventListener('click', onOutside, true);
+      document.removeEventListener('keydown', onKey, true);
+      resolve(result);
+    };
+    const onGo = () => finish(loadModeSettingsRadio.checked ? 'settings' : 'all');
+    const onOutside = (e) => { if (!loadDialog.contains(e.target)) finish(null); };
+    const onKey = (e) => { if (e.key === 'Escape') finish(null); };
+
+    loadGoBtn.addEventListener('click', onGo);
+    // Defer the dismiss listeners so the click/change that opened the picker
+    // doesn't immediately close the dialog.
+    setTimeout(() => {
+      document.addEventListener('click', onOutside, true);
+      document.addEventListener('keydown', onKey, true);
+    }, 0);
+  });
 }
 
 // ── Undo / Redo ──────────────────────────────────────────────────────────────

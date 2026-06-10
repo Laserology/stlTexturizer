@@ -446,6 +446,59 @@ main {
   margin: 14px 0 8px;
 }
 
+/* ── Advanced / Beta Features (collapsible) ──────────────────────────── */
+.advanced-toggle {
+  cursor: pointer;
+  user-select: none;
+  margin-bottom: 0 !important;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.advanced-chevron {
+  display: inline-block;
+  transition: transform 0.15s ease;
+  font-size: 9px;
+  line-height: 1;
+}
+
+.advanced-section:not(.collapsed) .advanced-chevron {
+  transform: rotate(90deg);
+}
+
+.advanced-section:not(.collapsed) .advanced-toggle {
+  margin-bottom: 10px !important;
+}
+
+.advanced-section.collapsed .advanced-content {
+  display: none;
+}
+
+.advanced-blurb {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin: 0 0 10px;
+  line-height: 1.4;
+}
+
+.advanced-section .panel-subsection-heading:first-of-type {
+  margin-top: 6px;
+}
+
+.bake-mask-row {
+  margin-bottom: 10px;
+}
+
+.bake-mask-row .checkbox-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text);
+  cursor: pointer;
+}
+
 /* ── Preset grid ─────────────────────────────────────────────────────── */
 .preset-grid {
   display: grid;
@@ -622,6 +675,30 @@ main {
 .slider-row input[type="range"]::-moz-range-thumb {
   width: 14px; height: 14px; border-radius: 50%;
   background: var(--accent); border: none; cursor: grab;
+}
+
+/* Resolution slider runs coarse → fine left-to-right, so the mm value (where
+   smaller = finer) decreases as you drag right. The coarse/fine captions below
+   carry the direction; the descending number is intentional. */
+.slider-stack {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.slider-stack input[type="range"] {
+  flex: 0 0 auto;
+  width: 100%;
+}
+/* Resolution only: min (0.01 mm, fine) on the right, max (2 mm, coarse) on the left. */
+#refine-length { direction: rtl; }
+.slider-captions {
+  display: flex;
+  justify-content: space-between;
+  font-size: 10px;
+  color: var(--text-muted, #888);
+  line-height: 1;
 }
 
 .val {
@@ -828,6 +905,41 @@ input[type="number"].val:focus { outline: none; border-color: var(--accent); }
   accent-color: #f59e0b;
   border-color: #f59e0b;
   outline: 1px solid #f59e0b;
+  color: #f59e0b;
+}
+
+/* ── Smart-resolution button + diagnostic ──────────────────────────────────── */
+.smart-res-btn {
+  display: block;
+  width: 100%;
+  margin-bottom: 6px;
+  padding: 7px 12px;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 12px;
+  transition: background 0.15s, border-color 0.15s, color 0.15s;
+}
+.smart-res-btn:hover:not(:disabled) {
+  border-color: var(--accent-hover);
+  color: var(--text);
+}
+.smart-res-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.smart-res-info {
+  font-size: 10px;
+  color: var(--text-muted);
+  margin-top: 4px;
+  margin-bottom: 6px;
+  line-height: 1.45;
+}
+.smart-res-info.hidden { display: none; }
+.smart-res-info .clamped {
   color: #f59e0b;
 }
 
@@ -1184,6 +1296,47 @@ input[type="number"].val:focus { outline: none; border-color: var(--accent); }
 
 /* Hide utility (used by JS to show/hide exclusion sub-rows) */
 .form-row.hidden { display: none; }
+
+/* Regularize debug knob group — visually nested under the toggle */
+.regularize-debug-rows {
+  margin: 4px 0 8px 16px;
+  padding-left: 8px;
+  border-left: 2px solid var(--border);
+}
+.regularize-debug-rows .form-row {
+  margin: 4px 0;
+}
+.regularize-debug-rows label {
+  flex: 1;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+.regularize-debug-rows input[type="number"] {
+  width: 80px;
+}
+.regularize-debug-rows.disabled {
+  opacity: 0.45;
+  pointer-events: none;
+}
+#harvest-tol-row.disabled {
+  opacity: 0.45;
+  pointer-events: none;
+}
+
+/* Debug stats for last picked triangle in masking mode */
+.masking-tri-debug {
+  margin: 8px 0 0 0;
+  padding: 6px 8px;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text-muted);
+  font-size: 10px;
+  line-height: 1.35;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  white-space: pre;
+  overflow-x: auto;
+}
 
 /* ── Precision masking ───────────────────────────────────────────────── */
 .precision-masking-row {
@@ -1623,6 +1776,16 @@ input[type="number"].val:focus { outline: none; border-color: var(--accent); }
   cursor: not-allowed;
 }
 
+.project-io .icon-btn.text-btn {
+  width: auto;
+  padding: 0 10px;
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  white-space: nowrap;
+}
+
 .export-dialog {
   position: absolute;
   top: calc(100% + 6px);
@@ -1653,9 +1816,18 @@ input[type="number"].val:focus { outline: none; border-color: var(--accent); }
   user-select: none;
 }
 
-.export-dialog label input[type="checkbox"] {
+.export-dialog label input[type="checkbox"],
+.export-dialog label input[type="radio"] {
   accent-color: var(--accent);
   cursor: pointer;
+}
+
+.export-dialog-title {
+  margin: 0 0 2px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-dim, var(--text));
+  max-width: 200px;
 }
 
 .export-dialog label input:disabled {

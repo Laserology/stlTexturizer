@@ -35,16 +35,58 @@
  * @param {THREE.BufferGeometry} geometry        non-indexed input
  * @param {number}               targetTriangles desired output face count
  * @param {function}             [onProgress]    callback(0–1)
+ * @param {boolean}              [harvestFlat]   continue past the target to
+ *   collapse the remaining near-zero-cost (flat) edges (default true)
+ * @param {number}               [harvestTol]    absolute per-collapse surface-
+ *   deviation tolerance in mm for harvesting; harvestCeil = harvestTol²
  * @returns {THREE.BufferGeometry}
  */
 
 import * as THREE from 'three';
 
-const QUANT         = 1e4;
+// Vertex-weld quantisation for buildIndexed. 1e6 → 1 nm cells, finer than the
+// float32 resolution of the incoming positions, so it behaves as exact-float
+// welding: bit-identical shared vertices (the pipeline moves watertight copies
+// by the same vector, so they stay identical) merge, while genuinely distinct
+// fine-feature vertices stay separate.
+//
+// The earlier 1e4 (0.1 µm) was far too coarse: on a real subdivided+displaced
+// mesh (dots texture, 0.35 mm edges) it fused ~10k distinct vertices, leaving the
+// pre-decimation mesh with 10,548 non-manifold edges; decimating that produced
+// hundreds of open edges and thousands of non-manifold edges. At 1e6 the same
+// mesh is fully manifold pre-decimation (0 non-manifold) and decimates to 0 open
+// edges. (1e5 was an intermediate improvement but still fused ~100 vertices at
+// fine resolution.) Measured, not estimated.
+//
+// QOFFSET/field width give a ±2147 mm coordinate range — ample for any printable
+// part; beyond that the packed keys would collide.
+const QUANT_DEFAULT = 1e6;
+const QOFFSET       = 2147483648; // 2^31 — keeps round(coord*QUANT)+offset ≥ 0 for |coord| ≤ 2147 mm
 const FLIP_DOT      = 0.2;  // cos ~78° — reject collapse if new normal deviates more
 const FLIP_DOT_SQ   = FLIP_DOT * FLIP_DOT;
 const CREASE_COS    = 0.5;  // cos 60° — edges sharper than this are treated as creases
 const CREASE_WEIGHT = 1e4;  // quadric penalty weight for crease edges
+
+// ── Flat-face harvesting (continue past the triangle target) ─────────────────
+// When the collapse loop reaches targetTriangles it would normally stop, leaving
+// behind flat faces that cost almost nothing to remove. With harvesting enabled
+// we keep collapsing past the target while each collapse's QEM error stays below
+// an ABSOLUTE tolerance (harvestCeil = harvestTol², a squared-distance bound),
+// then stop. Because the heap is cost-ordered, harvesting ends the instant the
+// cheapest remaining collapse exceeds the tolerance.
+//
+// Why absolute and not relative to the crossing cost: an earlier version scaled
+// the band as c_stop × factor. But when the limit is reached while a large flat
+// surplus still remains — the case with the MOST flat faces to shed — the
+// crossing cost c_stop ≈ 0 (measured ~3e-11), so c_stop × factor also collapses
+// to ≈0 and harvests almost nothing. An absolute error bound is regime-
+// independent: it converges to the same flat-removed mesh no matter where the
+// triangle target happened to land.
+//
+// harvestTol is an upper bound (mm) on the per-collapse surface deviation; the
+// real deviation is smaller, since the cost sums squared distances over all
+// incident faces. 0.005 mm ≈ a few microns — far below FDM resolution.
+const DEFAULT_HARVEST_TOL = 0.005;  // mm; harvestCeil = tol²
 
 // Time-based yield: only yield every ~100ms of wall time instead of every N iterations.
 // In foreground tabs setTimeout(0) costs ~4ms; in background tabs it's throttled to ~1s.
@@ -61,17 +103,14 @@ function _yieldFrame() {
   return new Promise(r => setTimeout(r, 0));
 }
 
-// Module-level Set for hasLinkViolation — avoids per-call heap allocation.
-// Module-level scratch arrays for hasLinkViolation — avoids new Map() per call.
-const _hlvHi = new Float64Array(512);
-const _hlvLo = new Int32Array(512);
-
 // ── Public API ───────────────────────────────────────────────────────────────
 
-export async function decimate(geometry, targetTriangles, onProgress) {
+export async function decimate(geometry, targetTriangles, onProgress, harvestFlat = true, harvestTol = DEFAULT_HARVEST_TOL) {
   const { positions, faces, vertCount, faceCount } = buildIndexed(geometry);
 
-  if (faceCount <= targetTriangles) return buildOutput(positions, faces, faceCount);
+  // Already at/under the target: nothing to decimate. But if harvesting is on we
+  // still run — there may be flat faces collapsible for free even below the limit.
+  if (faceCount <= targetTriangles && !harvestFlat) return buildOutput(positions, faces, faceCount);
 
   // Per-vertex error quadrics (10 doubles = upper triangle of symmetric 4×4)
   const quadrics = new Float64Array(vertCount * 10);
@@ -90,6 +129,9 @@ export async function decimate(geometry, targetTriangles, onProgress) {
   // Epoch stamp for neighbour deduplication — O(1) "clear" via epoch++
   const nbStamp = new Uint32Array(vertCount);
   let   epoch   = 1;
+  // Separate epoch-stamp array for the link-condition check (Guard 2).
+  const lkStamp = new Uint32Array(vertCount);
+  let   lkEpoch = 1;
   let   activeFaces = faceCount;
 
   // Seed min-heap with one entry per unique edge.
@@ -110,13 +152,33 @@ export async function decimate(geometry, targetTriangles, onProgress) {
   seedSeen.clear();
 
   const initFaces  = activeFaces;
-  const toRemove   = initFaces - targetTriangles;
+  // Progress denominator: triangles to remove to reach the target. When already
+  // at/under the target (harvest-only run), there is no meaningful endpoint, so
+  // fall back to initFaces to keep the reported fraction sane (monotonic, ≤1).
+  const toRemove   = Math.max(1, initFaces - targetTriangles);
   let   lastProg   = 0;
   let   iterations = 0;
 
-  while (activeFaces > targetTriangles && heap.size() > 0) {
+  // Flat-face harvesting: once the target is reached, keep collapsing while each
+  // collapse's QEM error stays below the absolute tolerance (harvestTol²).
+  const harvestCeil   = harvestTol * harvestTol;
+  let   reachedTarget = false;
+
+  while (heap.size() > 0) {
+    // Termination / harvest gate. On reaching the target we either stop (feature
+    // off) or enter harvest mode and keep collapsing below the error tolerance.
+    if (activeFaces <= targetTriangles) {
+      if (!harvestFlat) break;
+      reachedTarget = true;
+    }
+
     const idx = heap.pop();
     if (idx < 0) break;
+    const cost = heap.getCost(idx);
+
+    // In harvest mode the popped entry is the cheapest collapse left in the heap;
+    // once its error exceeds the tolerance nothing cheaper remains → finished.
+    if (reachedTarget && cost > harvestCeil) break;
 
     // Yield based on elapsed wall time (~every 100ms) instead of fixed iteration count.
     // Drastically reduces overhead in background tabs where setTimeout is throttled to 1s.
@@ -143,7 +205,8 @@ export async function decimate(geometry, targetTriangles, onProgress) {
     if (nsh < 2) continue;
 
     // ── Three safety guards ───────────────────────────────────────────────────
-    if (hasLinkViolation(faces, vfHead, slotFace, slotNext, v1, v2, vertCount)) continue;          // Guard 2
+    lkEpoch += 2;  // +2 so ep and ep+1 never collide with the next call
+    if (hasLinkViolation(faces, vfHead, slotFace, slotNext, v1, v2, lkStamp, lkEpoch)) continue; // Guard 2
     if (checkFlipped(positions, vfHead, slotFace, slotNext, faces, v1, v2, px, py, pz)) continue; // Guard 3a
     if (checkFlipped(positions, vfHead, slotFace, slotNext, faces, v2, v1, px, py, pz)) continue; // Guard 3b
 
@@ -272,40 +335,44 @@ function sharedFaceCount(faces, vfHead, slotFace, slotNext, v1, v2) {
   return count;
 }
 
-// ── Guard 2: Duplicate-face / pinch prevention ───────────────────────────────
-// Uses module-level scratch arrays (_hlvHi, _hlvLo) — zero allocation per call.
-// Linear scan is faster than Set for typical STL vertex valence (5-8).
-
-function hasLinkViolation(faces, vfHead, slotFace, slotNext, v1, v2, vc) {
-  const MUL = vc < 0x200000 ? 0x200000 : vc + 1;
-  let n = 0;
+// ── Guard 2: Link-condition (non-manifold / fold prevention) ─────────────────
+// Complete link-condition check (Dey et al.): an interior edge (v1,v2) is safe
+// to collapse iff the only common neighbours of v1 and v2 are the apex vertices
+// of the faces shared by the edge. Any extra common neighbour — or more than two
+// shared faces — would pile 3+ triangles onto an edge after the collapse, i.e.
+// create a non-manifold edge or fold. The old duplicate-face test only caught
+// the subset of these that produce identical triangles. O(valence) via stamps.
+// lkStamp[w] === ep      → w is a one-ring neighbour of v1
+// lkStamp[w] === ep + 1  → w is a legal shared-face apex (allowed)
+function hasLinkViolation(faces, vfHead, slotFace, slotNext, v1, v2, lkStamp, ep) {
+  // Pass 1: stamp every one-ring neighbour of v1.
   for (let s = vfHead[v1]; s >= 0; s = slotNext[s]) {
-    const f = slotFace[s];
-    if (faces[f * 3] < 0) continue;
-    let fa = faces[f*3], fb = faces[f*3+1], fc = faces[f*3+2];
-    if (fa === v2 || fb === v2 || fc === v2) continue;
-    let t;
-    if (fa > fb) { t = fa; fa = fb; fb = t; }
-    if (fb > fc) { t = fb; fb = fc; fc = t; }
-    if (fa > fb) { t = fa; fa = fb; fb = t; }
-    _hlvHi[n] = fa * MUL + fb;
-    _hlvLo[n] = fc;
-    n++;
+    const f = slotFace[s]; if (faces[f*3] < 0) continue;
+    const a = faces[f*3], b = faces[f*3+1], c = faces[f*3+2];
+    if (a !== v1) lkStamp[a] = ep;
+    if (b !== v1) lkStamp[b] = ep;
+    if (c !== v1) lkStamp[c] = ep;
   }
-  for (let s = vfHead[v2]; s >= 0; s = slotNext[s]) {
-    const f = slotFace[s];
-    if (faces[f * 3] < 0) continue;
-    let fa = faces[f*3], fb = faces[f*3+1], fc = faces[f*3+2];
-    if (fa === v1 || fb === v1 || fc === v1) continue;
-    if (fa === v2) fa = v1; else if (fb === v2) fb = v1; else fc = v1;
-    let t;
-    if (fa > fb) { t = fa; fa = fb; fb = t; }
-    if (fb > fc) { t = fb; fb = fc; fc = t; }
-    if (fa > fb) { t = fa; fa = fb; fb = t; }
-    const hi = fa * MUL + fb;
-    for (let i = 0; i < n; i++) {
-      if (_hlvHi[i] === hi && _hlvLo[i] === fc) return true;
+  // Pass 2: promote shared-face apexes to ep+1 (legal) and count shared faces.
+  let shared = 0;
+  for (let s = vfHead[v1]; s >= 0; s = slotNext[s]) {
+    const f = slotFace[s]; if (faces[f*3] < 0) continue;
+    const a = faces[f*3], b = faces[f*3+1], c = faces[f*3+2];
+    if (a === v2 || b === v2 || c === v2) {
+      shared++;
+      const apex = (a !== v1 && a !== v2) ? a : (b !== v1 && b !== v2) ? b : c;
+      lkStamp[apex] = ep + 1;
     }
+  }
+  if (shared > 2) return true; // edge already non-manifold (3+ shared faces)
+  // Pass 3: a neighbour of v2 that is a v1-neighbour (ep) but not a shared apex
+  // (ep+1) is an illegal common neighbour → collapse would be non-manifold.
+  for (let s = vfHead[v2]; s >= 0; s = slotNext[s]) {
+    const f = slotFace[s]; if (faces[f*3] < 0) continue;
+    const a = faces[f*3], b = faces[f*3+1], c = faces[f*3+2];
+    if (a !== v2 && a !== v1 && lkStamp[a] === ep) return true;
+    if (b !== v2 && b !== v1 && lkStamp[b] === ep) return true;
+    if (c !== v2 && c !== v1 && lkStamp[c] === ep) return true;
   }
   return false;
 }
@@ -555,6 +622,7 @@ function pushEdge(heap, quadrics, positions, version, v1, v2) {
 // Avoids template-string allocation by encoding quantised (ix,iy,iz) as a
 // BigInt key: this is still fast because we only call BigInt() once per vertex.
 function buildIndexed(geometry) {
+  const QUANT = QUANT_DEFAULT;
   const posAttr = geometry.attributes.position;
   const n = posAttr.count;
 
@@ -566,12 +634,12 @@ function buildIndexed(geometry) {
 
   for (let i = 0; i < n; i++) {
     const x = posAttr.getX(i), y = posAttr.getY(i), z = posAttr.getZ(i);
-    // Encode three 21-bit quantised integers into one BigInt key.
-    // Offset by 2^20 to handle negative coordinates.
-    const ix = (Math.round(x * QUANT) + 0x100000) >>> 0;
-    const iy = (Math.round(y * QUANT) + 0x100000) >>> 0;
-    const iz = (Math.round(z * QUANT) + 0x100000) >>> 0;
-    const key = (BigInt(ix) << 42n) | (BigInt(iy) << 21n) | BigInt(iz);
+    // Encode three 32-bit quantised integers into one BigInt key.
+    // Offset by 2^31 to handle negative coordinates (range ±2147 mm at QUANT=1e6).
+    const ix = Math.round(x * QUANT) + QOFFSET;
+    const iy = Math.round(y * QUANT) + QOFFSET;
+    const iz = Math.round(z * QUANT) + QOFFSET;
+    const key = (BigInt(ix) << 64n) | (BigInt(iy) << 32n) | BigInt(iz);
     let idx = vertMap.get(key);
     if (idx === undefined) {
       idx = vertCount++;
@@ -676,6 +744,7 @@ class SoAHeap {
     return 0;
   }
 
+  getCost(i) { return this._cost[i]; }
   getV1  (i) { return this._v1[i]; }
   getV2  (i) { return this._v2[i]; }
   getVer1(i) { return this._ver1[i]; }
